@@ -25,7 +25,8 @@ namespace __interception {
 // false on failure (including "couldn't find the function").
 
 // Overrides a function by its address.
-bool OverrideFunction(uptr old_func, uptr new_func, uptr *orig_old_func = 0);
+bool OverrideFunction(uptr old_func, uptr new_func, uptr *orig_old_func, const char *name);
+inline bool OverrideFunction(uptr old_func, uptr new_func, uptr *orig_old_func = 0) { return OverrideFunction(old_func, new_func, orig_old_func, "(null)"); }
 
 // Overrides a function in a system DLL or DLL CRT by its exported name.
 bool OverrideFunction(const char *name, uptr new_func, uptr *orig_old_func = 0);
@@ -74,7 +75,7 @@ void TestOnlyReleaseTrampolineRegions();
 #define INTERCEPT_FUNCTION_WIN(func)                                           \
   ::__interception::OverrideFunction((::__interception::uptr)func,             \
                                      (::__interception::uptr)WRAP(func),       \
-                                     (::__interception::uptr *)&REAL(func))
+                                     (::__interception::uptr *)&REAL(func), #func)
 #endif
 
 #define INTERCEPT_FUNCTION_VER_WIN(func, symver) INTERCEPT_FUNCTION_WIN(func)
