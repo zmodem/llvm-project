@@ -12,6 +12,7 @@
 //===----------------------------------------------------------------------===//
 #include "interception/interception.h"
 
+#include "sanitizer_common/sanitizer_atomic.h"
 #include "gtest/gtest.h"
 
 // Too slow for debug build
@@ -25,7 +26,19 @@
 #      define WIN32_LEAN_AND_MEAN
 #      include <windows.h>
 
+
+namespace __sanitizer {
+// XXX: The test binary doesn't include these; provide dummies for the VPrintf macro etc.
+void Printf(const char *format, ...) {}
+void PrintfHidden(const char *file, unsigned line, const char *format, ...) {}
+void DumpHiddenPrintfs() {}
+atomic_uint32_t current_verbosity;
+}
+
+
+
 namespace __interception {
+
 namespace {
 
 enum FunctionPrefixKind {

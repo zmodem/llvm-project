@@ -310,6 +310,26 @@ static void NOINLINE SharedPrintfCode(bool append_pid, const char *format,
                            format, args);
 }
 
+static char hidden_buf[256 * 1024];
+static uptr hidden_buf_size = 0;
+
+void PrintfHidden(const char *file, unsigned line, const char *format, ...) {
+  if (hidden_buf_size < sizeof(hidden_buf))
+    hidden_buf_size += internal_snprintf(hidden_buf + hidden_buf_size, sizeof(hidden_buf) - hidden_buf_size, "%s:%u ", file, line);
+  va_list args;
+  va_start(args, format);
+  if (hidden_buf_size < sizeof(hidden_buf))
+    hidden_buf_size += VSNPrintf(hidden_buf + hidden_buf_size, sizeof(hidden_buf) - hidden_buf_size, format, args);
+  va_end(args);
+}
+
+void DumpHiddenPrintfs() {
+  RawWrite("DUMPING HIDDEN PRINTFS:\n");
+  RawWrite(hidden_buf);
+  hidden_buf[0] = '\0';
+  hidden_buf_size = 0;
+}
+
 void Printf(const char *format, ...) {
   va_list args;
   va_start(args, format);

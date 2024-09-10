@@ -127,6 +127,7 @@
 #include "interception.h"
 
 #if SANITIZER_WINDOWS
+#include "sanitizer_common/sanitizer_common.h"
 #include "sanitizer_common/sanitizer_platform.h"
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -156,8 +157,10 @@ void SetErrorReportCallback(void (*callback)(const char *format, ...)) {
 
 #  define ReportError(...)                \
     do {                                  \
-      if (ErrorReportCallback)            \
+      if (ErrorReportCallback) { \
         ErrorReportCallback(__VA_ARGS__); \
+        DumpHiddenPrintfs(); \
+      } \
     } while (0)
 
 static void InterceptionFailed() {
@@ -262,6 +265,12 @@ static bool FunctionHasPadding(uptr address, uptr size) {
   if (size <= sizeof(kHintNop8Bytes) &&
       FunctionHasPrefix(address, kHintNop8Bytes))
     return true;
+  u8 *bytes = (u8 *)address;
+  VPrintf(5,
+      "not padding at %p: %02x %02x %02x %02x %02x "
+      "%02x %02x %02x\n",
+      (void *)address, bytes[0], bytes[1], bytes[2], bytes[3], bytes[4],
+      bytes[5], bytes[6], bytes[7]);
   return false;
 }
 
@@ -284,8 +293,10 @@ static void WriteJumpInstruction(uptr from, uptr target) {
 
 static void WriteShortJumpInstruction(uptr from, uptr target) {
   sptr offset = target - from - kShortJumpInstructionLength;
-  if (offset < -128 || offset > 127)
+  if (offset < -128 || offset > 127) {
+    VPrintf(5, "offset: %ll\n", (long long)offset);
     InterceptionFailed();
+  }
   *(u8*)from = 0xEB;
   *(u8*)(from + 1) = (u8)offset;
 }
@@ -345,12 +356,15 @@ static TrampolineMemoryRegion TrampolineRegions[kMaxTrampolineRegion];
 
 static void *AllocateTrampolineRegion(uptr image_address, size_t granularity) {
 #if SANITIZER_WINDOWS64
+  VPrintf(5, "AllocateTrampolineRegion\n");
   uptr address = image_address;
   uptr scanned = 0;
   while (scanned < kTrampolineScanLimitRange) {
     MEMORY_BASIC_INFORMATION info;
-    if (!::VirtualQuery((void*)address, &info, sizeof(info)))
+    if (!::VirtualQuery((void*)address, &info, sizeof(info))) {
+      VPrintf(5, "VirtualQuery failed\n");
       return nullptr;
+    }
 
     // Check whether a region can be allocated at |address|.
     if (info.State == MEM_FREE && info.RegionSize >= granularity) {
@@ -358,6 +372,7 @@ static void *AllocateTrampolineRegion(uptr image_address, size_t granularity) {
                                   granularity,
                                   MEM_RESERVE | MEM_COMMIT,
                                   PAGE_EXECUTE_READWRITE);
+      VPrintf(5, "page: %p\n", page);
       return page;
     }
 
@@ -365,6 +380,7 @@ static void *AllocateTrampolineRegion(uptr image_address, size_t granularity) {
     address = (uptr)info.BaseAddress + info.RegionSize;
     scanned += info.RegionSize;
   }
+  VPrintf(5, "failed to allocate any trampoline region\n");
   return nullptr;
 #else
   return ::VirtualAlloc(nullptr,
@@ -394,8 +410,10 @@ static uptr AllocateMemoryForTrampoline(uptr image_address, size_t size) {
       // No valid region found, allocate a new region.
       size_t bucket_size = GetMmapGranularity();
       void *content = AllocateTrampolineRegion(image_address, bucket_size);
-      if (content == nullptr)
+      if (content == nullptr) {
+        VPrintf(5, "AllocateMemoryForTrampoline failed: AllocateTrampolineRegion\n");
         return 0U;
+      }
 
       current->content = (uptr)content;
       current->allocated_size = 0;
@@ -417,8 +435,10 @@ static uptr AllocateMemoryForTrampoline(uptr image_address, size_t size) {
   }
 
   // Failed to find a region.
-  if (region == nullptr)
+  if (region == nullptr) {
+    VPrintf(5, "AllocateMemoryForTrampoline failed: failed to find a region\n");
     return 0U;
+  }
 
   // Allocate the space in the current region.
   uptr allocated_space = region->content + region->allocated_size;
@@ -465,9 +485,13 @@ static size_t GetInstructionSize(uptr address, size_t* rel_offset = nullptr) {
 
 #  if SANITIZER_WINDOWS_x64
   if (memcmp((u8*)address, kPrologueWithShortJump1,
-             sizeof(kPrologueWithShortJump1)) == 0 ||
-      memcmp((u8*)address, kPrologueWithShortJump2,
+             sizeof(kPrologueWithShortJump1)) == 0) {
+    return 0;
+    VPrintf(5, "prolog matches kPrologueWithShortJump1\n");
+  }
+  if (memcmp((u8*)address, kPrologueWithShortJump2,
              sizeof(kPrologueWithShortJump2)) == 0) {
+    VPrintf(5, "prolog matches kPrologueWithShortJump2\n");
     return 0;
   }
 #endif
@@ -521,6 +545,7 @@ static size_t GetInstructionSize(uptr address, size_t* rel_offset = nullptr) {
     case 0x7D:
     case 0x7E:
     case 0x7F:
+      VPrintf(5, "cannot overwrite control-instruction 1\n");
       return 0;
   }
 
@@ -538,6 +563,7 @@ static size_t GetInstructionSize(uptr address, size_t* rel_offset = nullptr) {
 
     // Cannot overwrite control-instruction. Return 0 to indicate failure.
     case 0x25FF:  // FF 25 XX XX XX XX : jmp [XXXXXXXX]
+      VPrintf(5, "cannot overwrite control-instruction 2\n");
       return 0;
   }
 
@@ -735,8 +761,10 @@ static bool CopyInstructions(uptr to, uptr from, size_t size) {
   while (cursor != size) {
     size_t rel_offset = 0;
     size_t instruction_size = GetInstructionSize(from + cursor, &rel_offset);
-    if (!instruction_size)
+    if (!instruction_size) {
+      VPrintf(5, "CopyInstructions failed due to GetInstructionSize failure\n");
       return false;
+    }
     _memcpy((void *)(to + cursor), (void *)(from + cursor),
             (size_t)instruction_size);
     if (rel_offset) {
@@ -745,8 +773,10 @@ static bool CopyInstructions(uptr to, uptr from, size_t size) {
       // this will be untrue if relocated_offset \notin [-2**31, 2**31)
       s64 delta = to - from;
       s64 relocated_offset = *(s32 *)(to + cursor + rel_offset) - delta;
-      if (-0x8000'0000ll > relocated_offset || relocated_offset > 0x7FFF'FFFFll)
+      if (-0x8000'0000ll > relocated_offset || relocated_offset > 0x7FFF'FFFFll) {
+        VPrintf(5, "CopyInstructions outside of rel_offset: 0x%llx\n", (long long)relocated_offset);
         return false;
+      }
 #  else
       // on 32-bit, the relative offset will always be correct
       s32 delta = to - from;
@@ -818,15 +848,19 @@ bool OverrideFunctionWithRedirectJump(
 
   // Change memory protection to writable.
   DWORD protection = 0;
-  if (!ChangeMemoryProtection(old_func, kJumpInstructionLength, &protection))
+  if (!ChangeMemoryProtection(old_func, kJumpInstructionLength, &protection)) {
+    VPrintf(5, "ChangeMemoryProtection failed\n");
     return false;
+  }
 
   // Write a relative jump to the redirected function.
   WriteJumpInstruction(old_func, FIRST_32_SECOND_64(new_func, trampoline));
 
   // Restore previous memory protection.
-  if (!RestoreMemoryProtection(old_func, kJumpInstructionLength, protection))
+  if (!RestoreMemoryProtection(old_func, kJumpInstructionLength, protection)) {
+    VPrintf(5, "RestoreMemoryProtection failed\n");
     return false;
+  }
 
   return true;
 }
@@ -840,18 +874,27 @@ bool OverrideFunctionWithHotPatch(
 
   // Validate that the function is hot patchable.
   size_t instruction_size = GetInstructionSize(old_func);
-  if (instruction_size < kShortJumpInstructionLength ||
-      !FunctionHasPadding(old_func, kHotPatchHeaderLen))
+  if (instruction_size < kShortJumpInstructionLength) {
+    VPrintf(5, "instruction_size to small: %zu\n", instruction_size);
     return false;
+  }
+  if (!FunctionHasPadding(old_func, kHotPatchHeaderLen)) {
+    VPrintf(5, "!FunctionHasPadding\n");
+    return false;
+  }
 
   if (orig_old_func) {
     // Put the needed instructions into the trampoline bytes.
     uptr trampoline_length = instruction_size + kDirectBranchLength;
     uptr trampoline = AllocateMemoryForTrampoline(old_func, trampoline_length);
-    if (!trampoline)
+    if (!trampoline) {
+      VPrintf(5, "no mem for trampoline\n");
       return false;
-    if (!CopyInstructions(trampoline, old_func, instruction_size))
+    }
+    if (!CopyInstructions(trampoline, old_func, instruction_size)) {
+      VPrintf(5, "CopyInstructions failed\n");
       return false;
+    }
     WriteDirectBranch(trampoline + instruction_size,
                       old_func + instruction_size);
     *orig_old_func = trampoline;
@@ -861,22 +904,28 @@ bool OverrideFunctionWithHotPatch(
   uptr indirect_address = 0;
 #if SANITIZER_WINDOWS64
   indirect_address = AllocateMemoryForTrampoline(old_func, kAddressLength);
-  if (!indirect_address)
+  if (!indirect_address) {
+    VPrintf(5, "failed to allocate for indirect_address\n");
     return false;
+  }
 #endif
 
   // Change memory protection to writable.
   DWORD protection = 0;
-  if (!ChangeMemoryProtection(header, patch_length, &protection))
+  if (!ChangeMemoryProtection(header, patch_length, &protection)) {
+    VPrintf(5, "ChangeMemoryProtection to writable failed\n");
     return false;
+  }
 
   // Write jumps to the redirected function.
   WriteBranch(header, indirect_address, new_func);
   WriteShortJumpInstruction(old_func, header);
 
   // Restore previous memory protection.
-  if (!RestoreMemoryProtection(header, patch_length, protection))
+  if (!RestoreMemoryProtection(header, patch_length, protection)) {
+    VPrintf(5, "ChangeMemoryProtection to restore failed\n");
     return false;
+  }
 
   return true;
 }
@@ -892,16 +941,22 @@ bool OverrideFunctionWithTrampoline(
     // Find out the number of bytes of the instructions we need to copy
     // to the trampoline.
     instructions_length = RoundUpToInstrBoundary(kBranchLength, old_func);
-    if (!instructions_length)
+    if (!instructions_length) {
+      VPrintf(5, "unknown instr length\n");
       return false;
+    }
 
     // Put the needed instructions into the trampoline bytes.
     uptr trampoline_length = instructions_length + kDirectBranchLength;
     uptr trampoline = AllocateMemoryForTrampoline(old_func, trampoline_length);
-    if (!trampoline)
+    if (!trampoline) {
+      VPrintf(5, "failed to allocate trampoline\n");
       return false;
-    if (!CopyInstructions(trampoline, old_func, instructions_length))
+    }
+    if (!CopyInstructions(trampoline, old_func, instructions_length)) {
+      VPrintf(5, "failed to copy\n");
       return false;
+    }
     WriteDirectBranch(trampoline + instructions_length,
                       old_func + instructions_length);
     *orig_old_func = trampoline;
@@ -911,12 +966,15 @@ bool OverrideFunctionWithTrampoline(
   // Check if the targeted address can be encoded in the function padding.
   // Otherwise, allocate it in the trampoline region.
   if (IsMemoryPadding(old_func - kAddressLength, kAddressLength)) {
+    VPrintf(5, "in the padding\n");
     indirect_address = old_func - kAddressLength;
     padding_length = kAddressLength;
   } else {
     indirect_address = AllocateMemoryForTrampoline(old_func, kAddressLength);
-    if (!indirect_address)
+    if (!indirect_address) {
+      VPrintf(5, "failed to allocate\n");
       return false;
+    }
   }
 #endif
 
@@ -924,31 +982,45 @@ bool OverrideFunctionWithTrampoline(
   uptr patch_address = old_func - padding_length;
   uptr patch_length = instructions_length + padding_length;
   DWORD protection = 0;
-  if (!ChangeMemoryProtection(patch_address, patch_length, &protection))
+  if (!ChangeMemoryProtection(patch_address, patch_length, &protection)) {
+    VPrintf(5, "failed to make writable\n");
     return false;
+  }
 
   // Patch the original function.
   WriteBranch(old_func, indirect_address, new_func);
 
   // Restore previous memory protection.
-  if (!RestoreMemoryProtection(patch_address, patch_length, protection))
+  if (!RestoreMemoryProtection(patch_address, patch_length, protection)) {
+    VPrintf(5, "failed to restore\n");
     return false;
+  }
 
   return true;
 }
 
 bool OverrideFunction(
-    uptr old_func, uptr new_func, uptr *orig_old_func) {
+    uptr old_func, uptr new_func, uptr *orig_old_func, const char *func_name) {
+  VPrintf(5, "OverrideFunction %s %p (orig_old: %p)\n", func_name, (void*)old_func, (void*)orig_old_func);
 #if !SANITIZER_WINDOWS64
-  if (OverrideFunctionWithDetour(old_func, new_func, orig_old_func))
+  if (OverrideFunctionWithDetour(old_func, new_func, orig_old_func)) {
+    VPrintf(5, "detour technique succeeded\n");
     return true;
+  }
 #endif
-  if (OverrideFunctionWithRedirectJump(old_func, new_func, orig_old_func))
+  if (OverrideFunctionWithRedirectJump(old_func, new_func, orig_old_func)) {
+    VPrintf(5, "redirect jump technique succeeded\n");
     return true;
-  if (OverrideFunctionWithHotPatch(old_func, new_func, orig_old_func))
+  }
+  if (OverrideFunctionWithHotPatch(old_func, new_func, orig_old_func)) {
+    VPrintf(5, "hotpatch technique succeeded\n");
     return true;
-  if (OverrideFunctionWithTrampoline(old_func, new_func, orig_old_func))
+  }
+  if (OverrideFunctionWithTrampoline(old_func, new_func, orig_old_func)) {
+    VPrintf(5, "trampoline technique succeeded\n");
     return true;
+  }
+  VPrintf(5, "FAILED\n");
   return false;
 }
 
@@ -977,8 +1049,10 @@ static void **InterestingDLLsAvailable() {
   static void *result[ARRAY_SIZE(InterestingDLLs)] = { 0 };
   if (!result[0]) {
     for (size_t i = 0, j = 0; InterestingDLLs[i]; ++i) {
-      if (HMODULE h = GetModuleHandleA(InterestingDLLs[i]))
+      if (HMODULE h = GetModuleHandleA(InterestingDLLs[i])) {
+        VPrintf(5, "Interesting DLL %zu: %s at %p\n", j, InterestingDLLs[i], (void*)h);
         result[j++] = (void *)h;
+      }
     }
   }
   return &result[0];
@@ -1005,6 +1079,7 @@ template <typename T> class RVAPtr {
 // want to intercept malloc *before* MSVCRT initializes. Our internal
 // implementation walks the export list manually without doing initialization.
 uptr InternalGetProcAddress(void *module, const char *func_name) {
+  VPrintf(5, "InternalGetProcAddress %p %s\n", module, func_name);
   // Check that the module header is full and present.
   RVAPtr<IMAGE_DOS_HEADER> dos_stub(module, 0);
   RVAPtr<IMAGE_NT_HEADERS> headers(module, dos_stub->e_lfanew);
@@ -1012,13 +1087,16 @@ uptr InternalGetProcAddress(void *module, const char *func_name) {
       headers->Signature != IMAGE_NT_SIGNATURE ||             // "PE\0\0"
       headers->FileHeader.SizeOfOptionalHeader <
           sizeof(IMAGE_OPTIONAL_HEADER)) {
+    VPrintf(5, "invalid header\n");
     return 0;
   }
 
   IMAGE_DATA_DIRECTORY *export_directory =
       &headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
-  if (export_directory->Size == 0)
+  if (export_directory->Size == 0) {
+    VPrintf(5, "no export directory\n");
     return 0;
+  }
   RVAPtr<IMAGE_EXPORT_DIRECTORY> exports(module,
                                          export_directory->VirtualAddress);
   RVAPtr<DWORD> functions(module, exports->AddressOfFunctions);
@@ -1040,19 +1118,25 @@ uptr InternalGetProcAddress(void *module, const char *func_name) {
         // exported directory.
         char function_name[256];
         size_t funtion_name_length = _strlen(func);
-        if (funtion_name_length >= sizeof(function_name) - 1)
+        if (funtion_name_length >= sizeof(function_name) - 1) {
+          VPrintf(5, "forward name too long: %s\n", func);
           InterceptionFailed();
+        }
 
         _memcpy(function_name, func, funtion_name_length);
         function_name[funtion_name_length] = '\0';
         char* separator = _strchr(function_name, '.');
-        if (!separator)
+        if (!separator) {
+          VPrintf(5, "no separator: %s\n", func);
           InterceptionFailed();
+        }
         *separator = '\0';
 
         void* redirected_module = GetModuleHandleA(function_name);
-        if (!redirected_module)
+        if (!redirected_module) {
+          VPrintf(5, "GetModuleHandleA(%s) failed\n", function_name);
           InterceptionFailed();
+        }
         return InternalGetProcAddress(redirected_module, separator + 1);
       }
 
@@ -1065,14 +1149,23 @@ uptr InternalGetProcAddress(void *module, const char *func_name) {
 
 bool OverrideFunction(
     const char *func_name, uptr new_func, uptr *orig_old_func) {
+  VPrintf(5, "OverrideFunction by name %s\n", func_name);
   bool hooked = false;
   void **DLLs = InterestingDLLsAvailable();
   for (size_t i = 0; DLLs[i]; ++i) {
     uptr func_addr = InternalGetProcAddress(DLLs[i], func_name);
-    if (func_addr &&
-        OverrideFunction(func_addr, new_func, orig_old_func)) {
-      hooked = true;
+    if (func_addr) {
+      VPrintf(5, "found in DLL %p\n", (void*)DLLs[i]);
+      if (OverrideFunction(func_addr, new_func, orig_old_func, func_name)) {
+        VPrintf(5, "hooked!\n");
+        hooked = true;
+      } else {
+        VPrintf(5, "not hooked!\n");
+      }
     }
+  }
+  if (!hooked) {
+    VPrintf(5, "NOT HOOKED AT ALL\n");
   }
   return hooked;
 }
@@ -1081,9 +1174,12 @@ bool OverrideImportedFunction(const char *module_to_patch,
                               const char *imported_module,
                               const char *function_name, uptr new_function,
                               uptr *orig_old_func) {
+  VPrintf(5, "OverrideImportedFunction(%s, %s, %s, %p, %p)\n", module_to_patch, imported_module, function_name, (void*)new_function, (void*)orig_old_func);
   HMODULE module = GetModuleHandleA(module_to_patch);
-  if (!module)
+  if (!module) {
+    VPrintf(5, "!module\n");
     return false;
+  }
 
   // Check that the module header is full and present.
   RVAPtr<IMAGE_DOS_HEADER> dos_stub(module, 0);
@@ -1092,6 +1188,7 @@ bool OverrideImportedFunction(const char *module_to_patch,
       headers->Signature != IMAGE_NT_SIGNATURE ||             // "PE\0\0"
       headers->FileHeader.SizeOfOptionalHeader <
           sizeof(IMAGE_OPTIONAL_HEADER)) {
+    VPrintf(5, "bad module header\n");
     return false;
   }
 
@@ -1107,8 +1204,10 @@ bool OverrideImportedFunction(const char *module_to_patch,
     if (_stricmp(&*modname, imported_module) == 0)
       break;
   }
-  if (imports->FirstThunk == 0)
+  if (imports->FirstThunk == 0) {
+    VPrintf(5, "imported module not found\n");
     return false;
+  }
 
   // We have two parallel arrays: the import address table (IAT) and the table
   // of names. They start out containing the same data, but the loader rewrites
@@ -1125,8 +1224,10 @@ bool OverrideImportedFunction(const char *module_to_patch,
         break;
     }
   }
-  if (name_table->u1.Ordinal == 0)
+  if (name_table->u1.Ordinal == 0) {
+    VPrintf(5, "didn't find the function\n");
     return false;
+  }
 
   // Now we have the correct IAT entry. Do the swap. We have to make the page
   // read/write first.
@@ -1134,14 +1235,18 @@ bool OverrideImportedFunction(const char *module_to_patch,
     *orig_old_func = iat->u1.AddressOfData;
   DWORD old_prot, unused_prot;
   if (!VirtualProtect(&iat->u1.AddressOfData, 4, PAGE_EXECUTE_READWRITE,
-                      &old_prot))
+                      &old_prot)) {
+    VPrintf(5, "failed to unprotect the page\n");
     return false;
+  }
   iat->u1.AddressOfData = new_function;
-  if (!VirtualProtect(&iat->u1.AddressOfData, 4, old_prot, &unused_prot))
+  if (!VirtualProtect(&iat->u1.AddressOfData, 4, old_prot, &unused_prot)) {
+    VPrintf(5, "failed to reprotect the page\n");
     return false;  // Not clear if this failure bothers us.
+  }
   return true;
 }
 
 }  // namespace __interception
 
-#endif  // SANITIZER_APPLE
+#endif  // SANITIZER_WINDOWS

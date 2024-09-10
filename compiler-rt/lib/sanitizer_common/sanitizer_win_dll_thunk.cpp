@@ -15,6 +15,7 @@
 #include "sanitizer_win_defs.h"
 #include "sanitizer_win_dll_thunk.h"
 #include "interception/interception.h"
+#include "sanitizer_common/sanitizer_atomic.h"
 
 extern "C" {
 void *WINAPI GetModuleHandleA(const char *module_name);
@@ -22,6 +23,13 @@ void abort();
 }
 
 namespace __sanitizer {
+
+// XXX: The DLL thunk doesn't include these; provide dummies for the VPrintf macro etc.
+void Printf(const char *format, ...) {}
+void PrintfHidden(const char *file, unsigned line, const char *format, ...) {}
+void DumpHiddenPrintfs() {}
+atomic_uint32_t current_verbosity;
+
 uptr dllThunkGetRealAddrOrDie(const char *name) {
   uptr ret =
       __interception::InternalGetProcAddress((void *)GetModuleHandleA(0), name);
