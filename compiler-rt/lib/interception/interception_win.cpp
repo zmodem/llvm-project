@@ -190,8 +190,12 @@ static uptr GetMmapGranularity() {
   return si.dwAllocationGranularity;
 }
 
+UNUSED static uptr RoundDownTo(uptr size, uptr boundary) {
+  return size & ~(boundary - 1);
+}
+
 UNUSED static uptr RoundUpTo(uptr size, uptr boundary) {
-  return (size + boundary - 1) & ~(boundary - 1);
+  return RoundDownTo(size + boundary - 1, boundary);
 }
 
 // FIXME: internal_str* and internal_mem* functions should be moved from the
@@ -351,36 +355,64 @@ struct TrampolineMemoryRegion {
   uptr max_size;
 };
 
-UNUSED static const uptr kTrampolineScanLimitRange = 1ull << 31;  // 2 gig
+UNUSED static const uptr kTrampolineRangeLimit = 1ull << 31;  // 2 gig
 static const int kMaxTrampolineRegion = 1024;
 static TrampolineMemoryRegion TrampolineRegions[kMaxTrampolineRegion];
 
-static void *AllocateTrampolineRegion(uptr image_address, size_t granularity) {
+static void *AllocateTrampolineRegion(uptr min_addr, uptr max_addr,
+                                      uptr func_addr, size_t granularity) {
 #if SANITIZER_WINDOWS64
-  VPrintf(5, "AllocateTrampolineRegion; image_address: %p, granularity: %zu\n", (void*)image_address, granularity);
-  uptr address = image_address;
-  uptr scanned = 0;
-  while (scanned < kTrampolineScanLimitRange) {
+  VPrintf(5, "AllocateTrampolineRegion; min_addr: %p, max_addr: %p, func_addr: %p, granularity: %zu\n", (void*)min_addr, (void*)max_addr, (void*)func_addr, granularity);
+
+  uptr lo_addr = RoundDownTo(func_addr, granularity);
+  uptr hi_addr = RoundUpTo(func_addr, granularity);
+  while (lo_addr >= min_addr || hi_addr <= max_addr) {
+    CHECK(lo_addr <= func_addr);
+    CHECK(hi_addr >= func_addr);
+
+    // To reduce fragmentation, prefer the address nearest to func_addr.
+    uptr addr;
+    if (lo_addr < min_addr)
+      addr = hi_addr;
+    else if (hi_addr > max_addr)
+      addr = lo_addr;
+    else
+      addr = (hi_addr - func_addr < func_addr - lo_addr) ? hi_addr : lo_addr;
+
+    VPrintf(5, "lo_addr: %p, hi_addr: %p, addr: %p\n", (void*)lo_addr, (void*)hi_addr, (void*)addr);
+
     MEMORY_BASIC_INFORMATION info;
-    if (!::VirtualQuery((void*)address, &info, sizeof(info))) {
+    if (!::VirtualQuery((void*)addr, &info, sizeof(info))) {
       VPrintf(5, "VirtualQuery failed\n");
       return nullptr;
     }
 
-    // Check whether a region can be allocated at |address|.
+    // Check whether a region can be allocated at |addr|.
     if (info.State == MEM_FREE && info.RegionSize >= granularity) {
-      void *page = ::VirtualAlloc((void*)RoundUpTo(address, granularity),
-                                  granularity,
+      void *page = ::VirtualAlloc((void*)addr, granularity,
                                   MEM_RESERVE | MEM_COMMIT,
                                   PAGE_EXECUTE_READWRITE);
-      VPrintf(5, "page: %p\n", page);
+      if (addr == lo_addr) {
+        VPrintf(5, "lo_addr page: %p\n", page);
+      } else {
+        VPrintf(5, "hi_addr page: %p\n", page);
+      }
       return page;
     }
 
-    // Move to the next region.
-    address = (uptr)info.BaseAddress + info.RegionSize;
-    scanned += info.RegionSize;
-    VPrintf(5, "address: %p, scanned: %p\n", (void*)address, (void*)scanned);
+    CHECK(addr == lo_addr || addr == hi_addr);
+    if (addr == lo_addr) {
+      // Move to the previous region.
+      VPrintf(5, "lowering lo_addr\n");
+      lo_addr = RoundDownTo((uptr)info.BaseAddress - granularity,
+                            granularity);
+    }
+    if (addr == hi_addr) {
+      // Move to the next region.
+      VPrintf(5, "raising hi_addr\n");
+      hi_addr = RoundUpTo((uptr)info.BaseAddress + info.RegionSize,
+                          granularity);
+    }
   }
   VPrintf(5, "failed to allocate any trampoline region\n");
   return nullptr;
@@ -404,17 +436,19 @@ void TestOnlyReleaseTrampolineRegions() {
 }
 
 static uptr AllocateMemoryForTrampoline(uptr func_address, size_t size) {
-  uptr image_address = func_address;
   VPrintf(5, "AllocateMemoryForTrampoline %p %zu\n", (void*)func_address, size);
+
 #if SANITIZER_WINDOWS64
-  // Allocate memory after the module (DLL or EXE file), but within 2GB
-  // of the start of the module so that any address within the module can be
-  // referenced with PC-relative operands.
+  // Allocate memory within 2GB of the module (DLL or EXE file) so that any
+  // address within the module can be referenced with PC-relative operands.
   // This allows us to not just jump to the trampoline with a PC-relative
   // offset, but to relocate any instructions that we copy to the trampoline
   // which have references to the original module. If we can't find the base
   // address of the module (e.g. if func_address is in mmap'ed memory), just
   // use func_address as is.
+  uptr min_addr = func_address - kTrampolineRangeLimit;
+  uptr max_addr = func_address + kTrampolineRangeLimit - size;
+
   HMODULE module;
   if (::GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -422,16 +456,29 @@ static uptr AllocateMemoryForTrampoline(uptr func_address, size_t size) {
     MODULEINFO module_info;
     if (::GetModuleInformation(::GetCurrentProcess(), module,
                                 &module_info, sizeof(module_info))) {
-      image_address = (uptr)module_info.lpBaseOfDll;
+      min_addr = (uptr)module_info.lpBaseOfDll + module_info.SizeOfImage -
+          kTrampolineRangeLimit;
+      max_addr = (uptr)module_info.lpBaseOfDll + kTrampolineRangeLimit - size;
     } else {
       VPrintf(5, "GetModuleInformation failed\n");
     }
   } else {
     VPrintf(5, "GetModuleHandleExW failed\n");
   }
-#endif
 
-  // Find a region within 2G with enough space to allocate |size| bytes.
+  // Check for overflow of addressable memory.
+  if (max_addr > 0x7fffffffffff)
+    max_addr = 0x7fffffffffff;
+  if (min_addr > func_address)
+    min_addr = 0;
+#else
+  uptr min_addr = 0;
+  uptr max_addr = ~min_addr;
+#endif
+  VPrintf(5, "min_addr: %p, max_addres: %p\n", (void*)min_addr, (void*)max_addr);
+
+  // Find a region within [min_addr,max_addr] with enough space to allocate
+  // |size| bytes.
   TrampolineMemoryRegion *region = nullptr;
   for (size_t bucket = 0; bucket < kMaxTrampolineRegion; ++bucket) {
     TrampolineMemoryRegion* current = &TrampolineRegions[bucket];
@@ -439,7 +486,8 @@ static uptr AllocateMemoryForTrampoline(uptr func_address, size_t size) {
     if (current->content == 0) {
       // No valid region found, allocate a new region.
       size_t bucket_size = GetMmapGranularity();
-      void *content = AllocateTrampolineRegion(image_address, bucket_size);
+      void *content = AllocateTrampolineRegion(min_addr, max_addr,
+                                               func_address, bucket_size);
       if (content == nullptr) {
         VPrintf(5, "AllocateMemoryForTrampoline failed: AllocateTrampolineRegion\n");
         return 0U;
@@ -451,15 +499,11 @@ static uptr AllocateMemoryForTrampoline(uptr func_address, size_t size) {
       region = current;
       break;
     } else if (current->max_size - current->allocated_size > size) {
-#if SANITIZER_WINDOWS64
-        // In 64-bits, the memory space must be allocated within 2G boundary.
         uptr next_address = current->content + current->allocated_size;
-        if (next_address < image_address ||
-            next_address - image_address >= 0x7FFF0000) {
+        if (next_address < min_addr || next_address > max_addr) {
           VPrintf(5, "current region outside 2GB boundary\n");
           continue;
         }
-#endif
       // The space can be allocated in the current region.
       region = current;
       break;
