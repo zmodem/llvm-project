@@ -387,6 +387,8 @@ static void *AllocateTrampolineRegion(uptr min_addr, uptr max_addr,
       return nullptr;
     }
 
+    VPrintf(5, "BaseAddress: %p AllocationBase: %p AllocationProtect: 0x%lx RegionSize: 0x%llx State: 0x%lx Protect: 0x%lx Type: 0x%lx\n", (void*)info.BaseAddress, (void*)info.AllocationBase, info.AllocationProtect, info.RegionSize, info.State, info.Protect, info.Type);
+
     // Check whether a region can be allocated at |addr|.
     if (info.State == MEM_FREE && info.RegionSize >= granularity) {
       void *page = ::VirtualAlloc((void*)addr, granularity,
@@ -400,11 +402,23 @@ static void *AllocateTrampolineRegion(uptr min_addr, uptr max_addr,
       return page;
     }
 
+    if (info.Type == MEM_IMAGE) {
+      HMODULE module;
+      if (::GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               (LPCWSTR)addr, &module)) {
+        char buf[256];
+        if (::GetModuleFileNameA(module, buf, sizeof(buf))) {
+          VPrintf(5, "module: %s\n", buf);
+        }
+      }
+    }
+
     CHECK(addr == lo_addr || addr == hi_addr);
     if (addr == lo_addr) {
       // Move to the previous region.
       VPrintf(5, "lowering lo_addr\n");
-      lo_addr = RoundDownTo((uptr)info.BaseAddress - granularity,
+      lo_addr = RoundDownTo((uptr)info.AllocationBase - granularity,
                             granularity);
     }
     if (addr == hi_addr) {

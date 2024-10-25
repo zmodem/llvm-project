@@ -310,7 +310,7 @@ static void NOINLINE SharedPrintfCode(bool append_pid, const char *format,
                            format, args);
 }
 
-static char hidden_buf[256 * 1024];
+static char hidden_buf[1024 * 1024];
 static uptr hidden_buf_size = 0;
 
 void PrintfHidden(const char *file, unsigned line, const char *format, ...) {
