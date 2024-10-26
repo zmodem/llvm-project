@@ -402,6 +402,7 @@ static void *AllocateTrampolineRegion(uptr min_addr, uptr max_addr,
       return page;
     }
 
+#if 0 // This would be nice, but maybe it's expensive?
     if (info.Type == MEM_IMAGE) {
       HMODULE module;
       if (::GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
@@ -413,6 +414,7 @@ static void *AllocateTrampolineRegion(uptr min_addr, uptr max_addr,
         }
       }
     }
+#endif
 
     CHECK(addr == lo_addr || addr == hi_addr);
     if (addr == lo_addr) {

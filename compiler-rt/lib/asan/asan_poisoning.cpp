@@ -411,8 +411,8 @@ void __sanitizer_annotate_contiguous_container(const void *beg_p,
                                                const void *new_mid_p) {
   if (!flags()->detect_container_overflow)
     return;
-  VPrintf(3, "contiguous_container: %p %p %p %p\n", beg_p, end_p, old_mid_p,
-          new_mid_p);
+  //VPrintf(3, "contiguous_container: %p %p %p %p\n", beg_p, end_p, old_mid_p,
+  //        new_mid_p);
   uptr storage_beg = reinterpret_cast<uptr>(beg_p);
   uptr storage_end = reinterpret_cast<uptr>(end_p);
   uptr old_end = reinterpret_cast<uptr>(old_mid_p);
@@ -480,9 +480,9 @@ void __sanitizer_annotate_double_ended_contiguous_container(
   if (!flags()->detect_container_overflow)
     return;
 
-  VPrintf(3, "contiguous_container: %p %p %p %p %p %p\n", storage_beg_p,
-          storage_end_p, old_container_beg_p, old_container_end_p,
-          new_container_beg_p, new_container_end_p);
+  //VPrintf(3, "contiguous_container: %p %p %p %p %p %p\n", storage_beg_p,
+  //        storage_end_p, old_container_beg_p, old_container_end_p,
+  //        new_container_beg_p, new_container_end_p);
 
   uptr storage_beg = reinterpret_cast<uptr>(storage_beg_p);
   uptr storage_end = reinterpret_cast<uptr>(storage_end_p);
@@ -696,8 +696,8 @@ void __sanitizer_copy_contiguous_container_annotations(const void *src_beg_p,
   if (!flags()->detect_container_overflow)
     return;
 
-  VPrintf(3, "contiguous_container_src: %p %p\n", src_beg_p, src_end_p);
-  VPrintf(3, "contiguous_container_dst: %p %p\n", dst_beg_p, dst_end_p);
+  //VPrintf(3, "contiguous_container_src: %p %p\n", src_beg_p, src_end_p);
+  //VPrintf(3, "contiguous_container_dst: %p %p\n", dst_beg_p, dst_end_p);
 
   uptr src_beg = reinterpret_cast<uptr>(src_beg_p);
   uptr src_end = reinterpret_cast<uptr>(src_end_p);
