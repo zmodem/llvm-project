@@ -362,7 +362,23 @@ static TrampolineMemoryRegion TrampolineRegions[kMaxTrampolineRegion];
 static void *AllocateTrampolineRegion(uptr min_addr, uptr max_addr,
                                       uptr func_addr, size_t granularity) {
 #if SANITIZER_WINDOWS64
-  VPrintf(5, "AllocateTrampolineRegion; min_addr: %p, max_addr: %p, func_addr: %p, granularity: %zu\n", (void*)min_addr, (void*)max_addr, (void*)func_addr, granularity);
+
+  // Clamp {min,max}_addr to the accessible address space.
+  SYSTEM_INFO system_info;
+  ::GetSystemInfo(&system_info);
+  uptr min_virtual_addr = RoundUpTo((uptr)system_info.lpMinimumApplicationAddress, granularity);
+  uptr max_virtual_addr = RoundDownTo((uptr)system_info.lpMaximumApplicationAddress, granularity);
+
+  VPrintf(5, "AllocateTrampolineRegion; min_addr: %p, max_addr: %p, func_addr: %p, granularity: %zu, min_virtual_addr: %p, max_virtual_addr: %p\n", (void*)min_addr, (void*)max_addr, (void*)func_addr, granularity, min_virtual_addr, max_virtual_addr);
+
+  if (min_addr < min_virtual_addr) {
+    min_addr = min_virtual_addr;
+    VPrintf(5, "clamped min_addr to %p\n", (void*)min_addr);
+  }
+  if (max_addr > max_virtual_addr) {
+    max_addr = max_virtual_addr;
+    VPrintf(5, "clamped max_addr to %p\n", (void*)max_addr);
+  }
 
   uptr lo_addr = RoundDownTo(func_addr, granularity);
   uptr hi_addr = RoundUpTo(func_addr, granularity);
@@ -482,11 +498,11 @@ static uptr AllocateMemoryForTrampoline(uptr func_address, size_t size) {
     VPrintf(5, "GetModuleHandleExW failed\n");
   }
 
-  // Check for overflow of addressable memory.
-  if (max_addr > 0x7fffffffffff)
-    max_addr = 0x7fffffffffff;
+  // Check for overflow.
   if (min_addr > func_address)
     min_addr = 0;
+  if (max_addr < func_address)
+    max_addr = ~(uptr)0;
 #else
   uptr min_addr = 0;
   uptr max_addr = ~min_addr;
