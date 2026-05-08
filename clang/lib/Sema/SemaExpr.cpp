@@ -3291,12 +3291,12 @@ recoverFromMSUnqualifiedLookup(Sema &S, ASTContext &Context,
       TemplateArgs);
 }
 
-ExprResult
-Sema::ActOnIdExpression(Scope *S, CXXScopeSpec &SS,
-                        SourceLocation TemplateKWLoc, UnqualifiedId &Id,
-                        bool HasTrailingLParen, bool IsAddressOfOperand,
-                        CorrectionCandidateCallback *CCC,
-                        bool IsInlineAsmIdentifier, Token *KeywordReplacement) {
+ExprResult Sema::ActOnIdExpression(Scope *S, CXXScopeSpec &SS,
+                                   SourceLocation TemplateKWLoc,
+                                   UnqualifiedId &Id, bool HasTrailingLParen,
+                                   bool IsAddressOfOperand,
+                                   CorrectionCandidateCallback *CCC,
+                                   bool IsInlineAsmIdentifier) {
   assert(!(IsAddressOfOperand && HasTrailingLParen) &&
          "cannot be direct & operand and have a trailing lparen");
   if (SS.isInvalid())
@@ -4816,6 +4816,10 @@ static bool CheckExtensionTraitOperandType(Sema &S, QualType T,
       return false;
     }
   }
+  if ((T->isVoidType() || T->isFunctionType()) &&
+      TraitKind == UETT_TMOGetTypeDescriptor) {
+    return true;
+  }
   return true;
 }
 
@@ -5208,6 +5212,9 @@ bool Sema::CheckUnaryExprOrTypeTraitOperand(QualType ExprType,
   if (ExprKind == UETT_PtrAuthTypeDiscriminator)
     return checkPtrAuthTypeDiscriminatorOperandType(*this, ExprType, OpLoc,
                                                     ExprRange);
+
+  if (ExprKind == UETT_TMOGetTypeDescriptor)
+    return checkTMOGetTypeDescriptor(ExprType, OpLoc, ExprRange);
 
   // Explicitly list some types as extensions.
   if (!CheckExtensionTraitOperandType(*this, ExprType, OpLoc, ExprRange,
@@ -6654,9 +6661,14 @@ Sema::ConvertArgumentsForCall(CallExpr *Call, Expr *Fn,
                               SourceLocation RParenLoc,
                               bool IsExecConfig) {
   // Bail out early if calling a builtin with custom typechecking.
+  // For HLSL builtin aliases, argument conversion is still needed because
+  // overload resolution may have selected a conversion sequence (e.g.,
+  // vector-to-scalar truncation) that must be applied before the custom
+  // type checker runs.
   if (FDecl)
     if (unsigned ID = FDecl->getBuiltinID())
-      if (Context.BuiltinInfo.hasCustomTypechecking(ID))
+      if (Context.BuiltinInfo.hasCustomTypechecking(ID) &&
+          !(Context.getLangOpts().HLSL && FDecl->hasAttr<BuiltinAliasAttr>()))
         return false;
 
   // C99 6.5.2.2p7 - the arguments are implicitly converted, as if by
@@ -7326,6 +7338,7 @@ ExprResult Sema::ActOnCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
     DiagCompat(Fn->getExprLoc(), diag_compat::adl_only_template_id)
         << ULE->getName();
   }
+  currentTMOContext().recordTMOInferenceCandidate(*this, Call.get());
 
   if (LangOpts.OpenMP)
     Call = OpenMP().ActOnOpenMPCall(Call, Scope, LParenLoc, ArgExprs, RParenLoc,
@@ -9108,6 +9121,18 @@ ExprResult Sema::BuildResolvedCallExpr(Expr *Fn, NamedDecl *NDecl,
 
   // Bail out early if calling a builtin with custom type checking.
   if (BuiltinID && Context.BuiltinInfo.hasCustomTypechecking(BuiltinID)) {
+    // For HLSL builtin aliases, the call was resolved via overload resolution
+    // which may have selected a conversion sequence (e.g., vector-to-scalar
+    // truncation). Convert arguments to match the declared prototype before
+    // the custom type checker runs, otherwise the builtin will operate on
+    // the unconverted argument types.
+    if (getLangOpts().HLSL && FDecl && FDecl->hasAttr<BuiltinAliasAttr>()) {
+      if (const auto *P = FDecl->getType()->getAs<FunctionProtoType>()) {
+        if (ConvertArgumentsForCall(TheCall, Fn, FDecl, P, Args, RParenLoc,
+                                    IsExecConfig))
+          return ExprError();
+      }
+    }
     ExprResult E = CheckBuiltinFunctionCall(FDecl, BuiltinID, TheCall);
     if (!E.isInvalid() && Context.BuiltinInfo.isImmediate(BuiltinID))
       E = CheckForImmediateInvocation(E, FDecl);

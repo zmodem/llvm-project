@@ -96,7 +96,7 @@ public:
   TargetMachine &TM;
 
   /// Target Asm Printer information.
-  const MCAsmInfo *MAI = nullptr;
+  const MCAsmInfo &MAI;
 
   /// This is the context for the output file that we are streaming. This owns
   /// all of the global MC-related objects for the generated translation unit.
@@ -361,9 +361,6 @@ public:
   const MCSubtargetInfo &getSubtargetInfo() const;
 
   void EmitToStreamer(MCStreamer &S, const MCInst &Inst);
-
-  /// Emits inital debug location directive.
-  void emitInitialRawDwarfLocDirective(const MachineFunction &MF);
 
   /// Return the current section we are emitting to.
   const MCSection *getCurrentSection() const;

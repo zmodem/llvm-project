@@ -434,6 +434,16 @@ class _LocalProcess(_BaseProcess):
 
         stdout = kwargs.pop("stdout", DEVNULL if not self._trace_on else None)
         stderr = kwargs.pop("stderr", None)
+        # This works around a bug in the macOS job control code where
+        # a supurious SIGHUP is sent to the the process group of our
+        # spawned subprocess when it is shutting down.
+        # While this SIGHUP doesn't cause any issues for our subprocess,
+        # it does reach the LIT process and stops the test suite run
+        # early.
+        # This parameter forces the spawned process into a new process
+        # group which prevents the supurious SIGHUP from reaching LIT.
+        # We don't
+        kwargs.setdefault("start_new_session", True)
 
         self._proc = Popen(
             [executable] + args,
@@ -826,11 +836,12 @@ class Base(unittest.TestCase):
             # Enable expensive validations in TypeSystemSwiftTypeRef.
             "settings set symbols.swift-validate-typesystem true",
             "settings set symbols.swift-typesystem-compiler-fallback false",
+            "settings set target.check-vo-ownership true",
         ]
 
         # Set any user-overridden settings.
         for setting, value in configuration.settings:
-            commands.append("settings set -- %s %s" % (setting, value))
+            commands.append("setting set -- %s %s" % (setting, value))
 
         # Make sure that a sanitizer LLDB's environment doesn't get passed on.
         if (
@@ -2266,6 +2277,8 @@ class TestBase(Base, metaclass=LLDBTestCaseFactory):
                 # Make sure we found the local shared library in the above code
                 self.assertTrue(os.path.exists(local_shlib_path))
 
+            if lldb.remote_platform:
+                local_shlib_path = os.path.realpath(local_shlib_path)
             # Add the shared library to our target
             shlib_module = target.AddModule(local_shlib_path, None, None, None)
             if lldb.remote_platform:
@@ -2586,7 +2599,7 @@ class TestBase(Base, metaclass=LLDBTestCaseFactory):
                 )
 
     def filecheck(
-        self, command, check_file, filecheck_options="", expect_cmd_failure=False
+        self, command, check_file, filecheck_options=None, expect_cmd_failure=False
     ):
         # Run the command.
         self.runCmd(
@@ -2613,7 +2626,10 @@ class TestBase(Base, metaclass=LLDBTestCaseFactory):
             self.assertTrue(False, "No valid FileCheck executable specified")
         filecheck_args = [filecheck_bin, check_file_abs]
         if filecheck_options:
-            filecheck_args.append(filecheck_options)
+            if isinstance(filecheck_options, list):
+                filecheck_args.extend(filecheck_options)
+            else:
+                filecheck_args.append(str(filecheck_options))
         subproc = Popen(
             filecheck_args,
             stdin=PIPE,
@@ -2645,14 +2661,16 @@ FileCheck output:
 
         self.assertEqual(cmd_status, 0)
 
-    def filecheck_log(
-        self, log_file, check_file, filecheck_options="", expect_cmd_failure=False
-    ):
+    def filecheck_log(self, log_file, check_file, filecheck_options=None):
+        input_option = f"-input-file={log_file}"
+        if filecheck_options:
+            filecheck_options = [filecheck_options, input_option]
+        else:
+            filecheck_options = input_option
         return self.filecheck(
-            f"platform shell -h -- cat {log_file}",
+            "script None",
             check_file,
             filecheck_options,
-            expect_cmd_failure,
         )
 
     def filecheck_log(

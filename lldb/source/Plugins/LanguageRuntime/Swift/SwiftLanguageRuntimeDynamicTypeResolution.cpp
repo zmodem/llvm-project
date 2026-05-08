@@ -21,6 +21,7 @@
 #include "Plugins/Language/Swift/LogChannelSwift.h"
 #include "Plugins/TypeSystem/Clang/TypeSystemClang.h"
 #include "Plugins/TypeSystem/Swift/SwiftDemangle.h"
+#include "lldb/DataFormatters/ValueObjectPrinter.h"
 #include "lldb/Host/SafeMachO.h"
 #include "lldb/Symbol/Variable.h"
 #include "lldb/Symbol/VariableList.h"
@@ -42,6 +43,7 @@
 #include "swift/AST/ASTWalker.h"
 #include "swift/Demangling/Demangle.h"
 #include "swift/Demangling/ManglingFlavor.h"
+#include "swift/RemoteInspection/DescriptorFinder.h"
 #include "swift/RemoteInspection/ReflectionContext.h"
 #include "swift/RemoteInspection/TypeRefBuilder.h"
 #include "swift/Strings.h"
@@ -434,21 +436,18 @@ CompilerType SwiftLanguageRuntime::LookupAnonymousClangType(const char *key) {
 std::optional<const swift::reflection::TypeInfo *>
 SwiftLanguageRuntime::lookupClangTypeInfo(CompilerType clang_type) {
   std::lock_guard<std::recursive_mutex> locker(m_clang_type_info_mutex);
+  lldb::opaque_compiler_type_t opaque_type = clang_type.GetOpaqueQualType();
+  if (m_clang_type_info_negative_cache.contains(opaque_type))
+    return nullptr;
   {
-    auto it = m_clang_type_info.find(clang_type.GetOpaqueQualType());
-    if (it != m_clang_type_info.end()) {
-      if (it->second)
-        return &*it->second;
-      return nullptr;
-    }
+    auto it = m_clang_builtin_type_info.find(opaque_type);
+    if (it != m_clang_builtin_type_info.end())
+      return &it->second;
   }
   {
-    auto it = m_clang_record_type_info.find(clang_type.GetOpaqueQualType());
-    if (it != m_clang_record_type_info.end()) {
-      if (it->second)
-        return &*it->second;
-      return nullptr;
-    }
+    auto it = m_clang_record_type_info.find(opaque_type);
+    if (it != m_clang_record_type_info.end())
+      return &it->second;
   }
   return {};
 }
@@ -459,7 +458,7 @@ const swift::reflection::TypeInfo *SwiftLanguageRuntime::emplaceClangTypeInfo(
     llvm::ArrayRef<swift::reflection::FieldInfo> fields) {
   const std::lock_guard<std::recursive_mutex> locker(m_clang_type_info_mutex);
   if (!byte_size || !bit_align) {
-    m_clang_type_info.insert({clang_type.GetOpaqueQualType(), std::nullopt});
+    m_clang_type_info_negative_cache.insert(clang_type.GetOpaqueQualType());
     return nullptr;
   }
   assert(*bit_align % 8 == 0 && "Bit alignment no a multiple of 8!");
@@ -471,19 +470,22 @@ const swift::reflection::TypeInfo *SwiftLanguageRuntime::emplaceClangTypeInfo(
     extra_inhabitants = swift::swift_getHeapObjectExtraInhabitantCount();
 
   if (fields.empty()) {
-    auto it_b = m_clang_type_info.insert(
+    auto it_b = m_clang_builtin_type_info.insert(
         {clang_type.GetOpaqueQualType(),
-         swift::reflection::TypeInfo(swift::reflection::TypeInfoKind::Builtin,
-                                     *byte_size, byte_align, byte_stride,
-                                     extra_inhabitants, true)});
-    return &*it_b.first->second;
+         swift::reflection::BuiltinTypeInfo(
+             *byte_size, byte_align, byte_stride, extra_inhabitants,
+             swift::reflection::BitwiseBorrowability::TakableAndBorrowable,
+             /*AFD=*/false)});
+    return &it_b.first->second;
   }
   auto it_b = m_clang_record_type_info.insert(
       {clang_type.GetOpaqueQualType(),
        swift::reflection::RecordTypeInfo(
-           *byte_size, byte_align, byte_stride, extra_inhabitants, false,
+           *byte_size, byte_align, byte_stride, extra_inhabitants,
+           swift::reflection::BitwiseBorrowability::None,
+           /*AFD=*/true,
            swift::reflection::RecordKind::Struct, fields)});
-  return &*it_b.first->second;
+  return &it_b.first->second;
 }
 
 std::optional<uint64_t>
@@ -1664,7 +1666,7 @@ SwiftLanguageRuntime::ProjectEnum(ValueObject &valobj) {
 
     return ValueObjectMemory::Create(exe_ctx.GetBestExecutionContextScope(),
                                      "$indirect." + field_info.Name,
-                                     payload_addr, payload_type);
+                                     payload_addr, payload_type, &valobj);
   };
 
   // Type infos of single case enums simply are the payload's type's type info,
@@ -1714,10 +1716,10 @@ SwiftLanguageRuntime::ProjectEnum(ValueObject &valobj) {
     } else {
       payload_type = ts.GetBuiltinRawPointerType(flavor);
     }
-
+    
     return ValueObjectMemory::Create(exe_ctx.GetBestExecutionContextScope(),
                                      "$indirect.$single_case", payload,
-                                     payload_type);
+                                     payload_type, &valobj);
   };
 
   // Is this single-case indirect enum? These get lowered into their payload

@@ -1354,6 +1354,7 @@ bool ToolChain::isThreadModelSupported(const StringRef Model) const {
 }
 
 std::string ToolChain::ComputeLLVMTriple(const ArgList &Args,
+                                         StringRef BoundArch,
                                          types::ID InputType) const {
   switch (getTriple().getArch()) {
   default:
@@ -1407,8 +1408,9 @@ std::string ToolChain::ComputeLLVMTriple(const ArgList &Args,
 }
 
 std::string ToolChain::ComputeEffectiveClangTriple(const ArgList &Args,
+                                                   StringRef BoundArch,
                                                    types::ID InputType) const {
-  return ComputeLLVMTriple(Args, InputType);
+  return ComputeLLVMTriple(Args, BoundArch, InputType);
 }
 
 std::string ToolChain::computeSysRoot() const {
@@ -1899,7 +1901,7 @@ llvm::opt::DerivedArgList *ToolChain::TranslateOpenMPTargetArgs(
       llvm::Triple TT = normalizeOffloadTriple(A->getValue(0));
 
       // Passing device args: -Xopenmp-target=<triple> -opt=val.
-      if (TT.getTriple() == getTripleString())
+      if (TT.isCompatibleWith(getTriple()))
         Index = Args.getBaseArgs().MakeIndex(A->getValue(1));
       else
         continue;
@@ -2010,6 +2012,14 @@ void ToolChain::TranslateXarchArgs(
     AllocatedArgs->push_back(A);
 }
 
+/// Match any triple recognized arch aliases.
+static bool isXArchCompatibleTripleArch(const llvm::Triple &TT,
+                                        StringRef XArchVal) {
+  llvm::Triple ParsedTriple(XArchVal);
+  return TT.getArch() == ParsedTriple.getArch() &&
+         TT.getSubArch() == ParsedTriple.getSubArch();
+}
+
 llvm::opt::DerivedArgList *ToolChain::TranslateXarchArgs(
     const llvm::opt::DerivedArgList &Args, StringRef BoundArch,
     Action::OffloadKind OFK,
@@ -2028,8 +2038,10 @@ llvm::opt::DerivedArgList *ToolChain::TranslateXarchArgs(
       NeedTrans = !IsDevice;
       Skip = IsDevice;
     } else if (A->getOption().matches(options::OPT_Xarch__)) {
-      NeedTrans = A->getValue() == getArchName() ||
-                  (!BoundArch.empty() && A->getValue() == BoundArch);
+      StringRef Val = A->getValue();
+      NeedTrans = Val == getArchName() ||
+                  (!BoundArch.empty() && Val == BoundArch) ||
+                  isXArchCompatibleTripleArch(Triple, Val);
       Skip = !NeedTrans;
     }
     if (NeedTrans || Skip)

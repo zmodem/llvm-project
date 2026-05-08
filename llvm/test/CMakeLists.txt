@@ -32,6 +32,7 @@ llvm_canonicalize_cmake_booleans(
   LLVM_INCLUDE_SPIRV_TOOLS_TESTS
   LLVM_APPEND_VC_REV
   LLVM_HAS_LOGF128
+  LLVM_HAVE_OPENCSD
   )
 
 configure_lit_site_cfg(
@@ -108,6 +109,7 @@ set(LLVM_TEST_DEPENDS
   llvm-dwp
   llvm-exegesis
   llvm-extract
+  llvm-extract-bundle-entry
   llvm-gsymutil
   llvm-ir2vec
   llvm-isel-fuzzer

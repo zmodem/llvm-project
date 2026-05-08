@@ -15,6 +15,9 @@ from lit.llvm.subst import FindTool
 
 # Configuration file for the 'lit' test runner.
 
+if lit.util.pythonize_bool(lit_config.params.get("use_normalized_slashes")):
+    config.available_features.add("windows-prefer-forward-slash")
+
 # name: The name of this test suite.
 config.name = "Clang"
 
@@ -119,7 +122,6 @@ tools = [
     "apinotes-test",
     "c-index-test",
     "cache-build-session",
-    "cir-opt",
     "clang-diff",
     "clang-format",
     "clang-repl",
@@ -147,6 +149,9 @@ tools = [
     "clang-ssaf-linker",
     "clang-ssaf-format",
 ]
+
+if config.clang_enable_cir:
+    tools.append("cir-opt")
 
 if config.clang_examples:
     config.available_features.add("examples")

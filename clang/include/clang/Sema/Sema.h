@@ -68,6 +68,7 @@
 #include "clang/Sema/SemaBase.h"
 #include "clang/Sema/SemaConcept.h"
 #include "clang/Sema/SemaRISCV.h"
+#include "clang/Sema/TypedMemoryCallsiteContext.h"
 #include "clang/Sema/TypoCorrection.h"
 #include "clang/Sema/Weak.h"
 #include "llvm/ADT/APInt.h"
@@ -4024,7 +4025,8 @@ public:
   /// \#pragma redefine_extname before declared.  Used in Solaris system headers
   /// to define functions that occur in multiple standards to call the version
   /// in the currently selected standard.
-  llvm::DenseMap<IdentifierInfo *, AsmLabelAttr *> ExtnameUndeclaredIdentifiers;
+  llvm::MapVector<IdentifierInfo *, AsmLabelAttr *>
+      ExtnameUndeclaredIdentifiers;
 
   /// Set containing all typedefs that are likely unused.
   llvm::SmallSetVector<const TypedefNameDecl *, 4>
@@ -7690,8 +7692,7 @@ public:
                                SourceLocation TemplateKWLoc, UnqualifiedId &Id,
                                bool HasTrailingLParen, bool IsAddressOfOperand,
                                CorrectionCandidateCallback *CCC = nullptr,
-                               bool IsInlineAsmIdentifier = false,
-                               Token *KeywordReplacement = nullptr);
+                               bool IsInlineAsmIdentifier = false);
 
   /// Decomposes the given name into a DeclarationNameInfo, its location, and
   /// possibly a list of template arguments.
@@ -13634,7 +13635,7 @@ public:
   void DeclareImplicitDeductionGuides(TemplateDecl *Template,
                                       SourceLocation Loc);
 
-  FunctionTemplateDecl *DeclareAggregateDeductionGuideFromInitList(
+  CXXDeductionGuideDecl *DeclareAggregateDeductionGuideFromInitList(
       TemplateDecl *Template, MutableArrayRef<QualType> ParamTypes,
       SourceLocation Loc);
 
@@ -14221,6 +14222,9 @@ public:
     }
 
     ~ScopedCodeSynthesisContext() { S.popCodeSynthesisContext(); }
+    ScopedCodeSynthesisContext(const ScopedCodeSynthesisContext &) = delete;
+    ScopedCodeSynthesisContext &
+    operator=(const ScopedCodeSynthesisContext &) = delete;
   };
 
   /// List of active code synthesis contexts.
@@ -14697,6 +14701,8 @@ public:
   public:
     FPFeaturesStateRAII(Sema &S);
     ~FPFeaturesStateRAII();
+    FPFeaturesStateRAII(const FPFeaturesStateRAII &) = delete;
+    FPFeaturesStateRAII &operator=(const FPFeaturesStateRAII &) = delete;
     FPOptionsOverride getOverrides() { return OldOverrides; }
 
   private:
@@ -14781,6 +14787,10 @@ public:
         : TmplAttr(A), Scope(S), NewDecl(D) {}
   };
   typedef SmallVector<LateInstantiatedAttribute, 1> LateInstantiatedAttrVec;
+
+  /// Recheck instantiated thread-safety attributes that could not be validated
+  /// on the dependent pattern declaration.
+  bool checkInstantiatedThreadSafetyAttrs(const Decl *D, const Attr *A);
 
   void InstantiateAttrs(const MultiLevelTemplateArgumentList &TemplateArgs,
                         const Decl *Pattern, Decl *Inst,
@@ -16395,6 +16405,38 @@ public:
   void performFunctionEffectAnalysis(TranslationUnitDecl *TU);
 
   ///@}
+
+  //===--------------------------------------------------------------------===//
+  // Typed Memory Operations
+  //===--------------------------------------------------------------------===//
+  /// @{
+private:
+  // TMO context information used to track non-function scoped TMO calls, such
+  // as global or declaration scoped initializers and similar.
+  sema::TypedMemoryCallsiteContext NonFunctionTMOContext;
+  bool checkTMOGetTypeDescriptor(QualType T, SourceLocation Loc,
+                                 SourceRange ArgRange);
+
+  void emitTMODiagnosticsForTypeQuery(SourceLocation QueryLocation,
+                                      SourceRange ExpressionRange,
+                                      QualType QueriedType);
+
+public:
+  sema::TypedMemoryCallsiteContext &currentTMOContext() {
+    if (auto *EnclosingFunctionScope = getEnclosingFunction())
+      return EnclosingFunctionScope->TMOContext;
+    return NonFunctionTMOContext;
+  }
+
+  // While performing semantic analysis of full expressions or initializers
+  // we accumulate all the allocation calls in that expression, and the
+  // casts of the results of any such allocation calls. At the end of the
+  // expression analysis we perform the TMO inference and diagnostics of any
+  // such calls we've encountered.
+  void finalizeOutstandingTMOCandidates() {
+    currentTMOContext().finalizeOutstandingTMOCandidates(*this);
+  }
+  /// @}
 };
 
 DeductionFailureInfo

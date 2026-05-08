@@ -61,6 +61,7 @@
 #include <string_view>
 
 #if LLDB_ENABLE_SWIFT
+#include "PdbAstBuilderSwift.h"
 #include "swift/Demangling/Demangle.h"
 #endif
 
@@ -373,7 +374,17 @@ static bool IsSwiftType(PdbTypeSymId type_id, PdbIndex& index) {
     return false;
   ClassRecord cr;
   llvm::cantFail(TypeDeserializer::deserializeAs<ClassRecord>(cvt, cr));
-  return cr.hasUniqueName() && swift::Demangle::isSwiftSymbol(cr.UniqueName);
+  if (cr.hasUniqueName())
+    return swift::Demangle::isSwiftSymbol(cr.UniqueName);
+  auto unwrapped = PdbAstBuilderSwift::MaybeUnwrapBoundGeneric(cr, index.tpi());
+  // Deserialization failed.
+  if (!unwrapped) {
+    LLDB_LOG_ERROR(GetLog(LLDBLog::Symbols), unwrapped.takeError(),
+                   "Deserialization failure while checking for Swift bound generic: {0}");
+    return false;
+  }
+  // Doesn't match the shape.
+  return !unwrapped->empty();
 #else
   return false;
 #endif
@@ -1532,8 +1543,11 @@ bool SymbolFileNativePDB::ParseLineTable(CompileUnit &comp_unit) {
     for (const LineColumnEntry &group : lines) {
       llvm::Expected<uint32_t> file_index_or_err =
           GetFileIndex(*cii, group.NameIndex);
-      if (!file_index_or_err)
+      if (!file_index_or_err) {
+        LLDB_LOG_ERROR(GetLog(LLDBLog::Symbols), file_index_or_err.takeError(),
+                       "failed to get file index for line entry: {0}");
         continue;
+      }
       uint32_t file_index = file_index_or_err.get();
       lldbassert(!group.LineNumbers.empty());
       CompilandIndexItem::GlobalLineTable::Entry line_entry(
@@ -1736,8 +1750,11 @@ void SymbolFileNativePDB::ParseInlineSite(PdbCompilandSymId id,
   FileSpec decl_file;
   llvm::Expected<uint32_t> file_index_or_err =
       GetFileIndex(*cii, inlinee_line.Header->FileID);
-  if (!file_index_or_err)
+  if (!file_index_or_err) {
+    LLDB_LOG_ERROR(GetLog(LLDBLog::Symbols), file_index_or_err.takeError(),
+                   "failed to get file index for inline site: {0}");
     return;
+  }
   uint32_t file_offset = file_index_or_err.get();
   decl_file = files.GetFileSpecAtIndex(file_offset);
   uint32_t decl_line = inlinee_line.Header->SourceLineNum;
@@ -1972,8 +1989,11 @@ size_t SymbolFileNativePDB::ParseSymbolArrayInScope(
 void SymbolFileNativePDB::DumpClangAST(Stream &s, llvm::StringRef filter,
                                        bool show_color) {
   auto ts_or_err = GetTypeSystemForLanguage(eLanguageTypeC_plus_plus);
-  if (!ts_or_err)
+  if (!ts_or_err) {
+    LLDB_LOG_ERROR(GetLog(LLDBLog::Symbols), ts_or_err.takeError(),
+                   "failed to get C++ type system: {0}");
     return;
+  }
   auto ts = *ts_or_err;
   TypeSystemClang *clang = llvm::dyn_cast_or_null<TypeSystemClang>(ts.get());
   if (!clang)

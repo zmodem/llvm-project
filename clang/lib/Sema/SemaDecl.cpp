@@ -3201,15 +3201,16 @@ static void checkNewAttributesAfterDef(Sema &S, Decl *New, const Decl *Old) {
         --E;
         continue;
       }
-    } else if (isa<SelectAnyAttr>(NewAttribute) &&
-               cast<VarDecl>(New)->isInline() &&
-               !cast<VarDecl>(New)->isInlineSpecified()) {
+    } else if (isa<SelectAnyAttr>(NewAttribute)) {
       // Don't warn about applying selectany to implicitly inline variables.
       // Older compilers and language modes would require the use of selectany
       // to make such variables inline, and it would have no effect if we
       // honored it.
-      ++I;
-      continue;
+      if (const auto *VD = dyn_cast<VarDecl>(New);
+          VD && VD->isInline() && !VD->isInlineSpecified()) {
+        ++I;
+        continue;
+      }
     } else if (isa<OMPDeclareVariantAttr>(NewAttribute)) {
       // We allow to add OMP[Begin]DeclareVariantAttr to be added to
       // declarations after definitions.
@@ -4703,6 +4704,27 @@ bool Sema::MergeFunctionDecl(FunctionDecl *New, NamedDecl *&OldD, Scope *S,
     return true;
   }
 
+  auto *OldTypedMemoryAttr = Old->getAttr<TypedMemoryAttr>();
+  auto *NewTypedMemoryAttr = New->getAttr<TypedMemoryAttr>();
+  if (OldTypedMemoryAttr && NewTypedMemoryAttr) {
+    if (OldTypedMemoryAttr->getRewriteTarget() !=
+        NewTypedMemoryAttr->getRewriteTarget()) {
+      Diag(NewTypedMemoryAttr->getLocation(),
+           diag::err_incompatible_duplicate_attribute)
+          << NewTypedMemoryAttr;
+      Diag(OldTypedMemoryAttr->getLocation(), diag::note_conflicting_attribute);
+      return true;
+    }
+    if (OldTypedMemoryAttr->getInferredParameterIdx() !=
+        NewTypedMemoryAttr->getInferredParameterIdx()) {
+      Diag(NewTypedMemoryAttr->getLocation(),
+           diag::err_incompatible_duplicate_attribute)
+          << NewTypedMemoryAttr;
+      Diag(OldTypedMemoryAttr->getLocation(), diag::note_conflicting_attribute);
+      return true;
+    }
+  }
+
   /*TO_UPSTREAM(BoundsSafety) ON */
   if (getLangOpts().BoundsSafetyAttributes) {
     // This is the same logic to suppress warnings in system headers.
@@ -5551,25 +5573,6 @@ void Sema::MergeVarDecl(VarDecl *New, LookupResult &Previous) {
       return New->setInvalidDecl();
     }
   }
-
-  // C2y 6.7.1p7:
-  //   Within a translation unit, the same identifier shall not appear with
-  //   both internal and external linkage.
-  //
-  // In C11 through C23, this was undefined behavior (C11 6.2.2p7).
-  //
-  // This can occur when an extern declaration in block scope finds a file-scope
-  // static declaration, but a no-linkage local variable shadowed the static,
-  // preventing linkage inheritance per C2y 6.2.2p4.
-  if (!getLangOpts().CPlusPlus && New->isLocalVarDecl() &&
-      New->hasExternalStorage() && Old->isFileVarDecl() && Old->hasLinkage() &&
-      Previous.isShadowed() && Old->getFormalLinkage() == Linkage::Internal) {
-    Diag(New->getLocation(), diag::err_internal_extern_mismatch)
-        << New->getDeclName() << getLangOpts().C2y;
-    Diag(OldLocation, PrevDiag);
-    return New->setInvalidDecl();
-  }
-
   // C99 6.2.2p4:
   //   For an identifier declared with the storage-class specifier
   //   extern in a scope in which a prior declaration of that
@@ -5764,7 +5767,8 @@ bool Sema::checkVarDeclRedefinition(VarDecl *Old, VarDecl *New) {
   if (!hasVisibleDefinition(Old) &&
       (New->getFormalLinkage() == Linkage::Internal || New->isInline() ||
        isa<VarTemplateSpecializationDecl>(New) ||
-       New->getDescribedVarTemplate() || New->getNumTemplateParameterLists() ||
+       New->getDescribedVarTemplate() ||
+       !New->getTemplateParameterLists().empty() ||
        New->getDeclContext()->isDependentContext() ||
        New->hasAttr<SelectAnyAttr>())) {
     // The previous definition is hidden, and multiple definitions are
@@ -7842,13 +7846,6 @@ static void SetNestedNameSpecifier(Sema &S, DeclaratorDecl *DD, Declarator &D) {
 }
 
 void Sema::deduceOpenCLAddressSpace(VarDecl *Var) {
-  QualType Type = Var->getType();
-  if (Type.hasAddressSpace())
-    return;
-  if (Type->isDependentType())
-    return;
-  if (Type->isSamplerT() || Type->isVoidType())
-    return;
   LangAS ImplAS = LangAS::opencl_private;
   // OpenCL C v3.0 s6.7.8 - For OpenCL C 2.0 or with the
   // __opencl_c_program_scope_global_variables feature, the address space
@@ -7857,27 +7854,7 @@ void Sema::deduceOpenCLAddressSpace(VarDecl *Var) {
   if (getOpenCLOptions().areProgramScopeVariablesSupported(getLangOpts()) &&
       Var->hasGlobalStorage())
     ImplAS = LangAS::opencl_global;
-  // If the original type from a decayed type is an array type and that array
-  // type has no address space yet, deduce it now.
-  if (auto DT = dyn_cast<DecayedType>(Type)) {
-    auto OrigTy = DT->getOriginalType();
-    if (!OrigTy.hasAddressSpace() && OrigTy->isArrayType()) {
-      // Add the address space to the original array type and then propagate
-      // that to the element type through `getAsArrayType`.
-      OrigTy = Context.getAddrSpaceQualType(OrigTy, ImplAS);
-      OrigTy = QualType(Context.getAsArrayType(OrigTy), 0);
-      // Re-generate the decayed type.
-      Type = Context.getDecayedType(OrigTy);
-    }
-  }
-  Type = Context.getAddrSpaceQualType(Type, ImplAS);
-  // Apply any qualifiers (including address space) from the array type to
-  // the element type. This implements C99 6.7.3p8: "If the specification of
-  // an array type includes any type qualifiers, the element type is so
-  // qualified, not the array type."
-  if (Type->isArrayType())
-    Type = QualType(Context.getAsArrayType(Type), 0);
-  Var->setType(Type);
+  Var->assignAddressSpace(Context, ImplAS);
 }
 
 /* TO_UPSTREAM(BoundsSafety) ON*/
@@ -7960,15 +7937,16 @@ static void checkAliasAttr(Sema &S, NamedDecl &ND) {
 }
 
 static void checkSelectAnyAttr(Sema &S, NamedDecl &ND) {
-  // 'selectany' only applies to externally visible variable declarations.
-  // It does not apply to functions.
-  if (SelectAnyAttr *Attr = ND.getAttr<SelectAnyAttr>()) {
-    if (isa<FunctionDecl>(ND) || !ND.isExternallyVisible()) {
-      S.Diag(Attr->getLocation(),
-             diag::err_attribute_selectany_non_extern_data);
-      ND.dropAttr<SelectAnyAttr>();
-    }
-  }
+  SelectAnyAttr *Attr = ND.getAttr<SelectAnyAttr>();
+  if (!Attr)
+    return;
+
+  if (const auto *VD = dyn_cast<VarDecl>(&ND);
+      VD && !VD->isStaticDataMember() && VD->isExternallyVisible())
+    return;
+
+  S.Diag(Attr->getLocation(), diag::err_attribute_selectany_non_extern_var);
+  ND.dropAttr<SelectAnyAttr>();
 }
 
 static void checkHybridPatchableAttr(Sema &S, NamedDecl &ND) {
@@ -9118,7 +9096,7 @@ NamedDecl *Sema::ActOnVariableDeclarator(
     // Insert the asm attribute.
     NewVD->addAttr(AsmLabelAttr::Create(Context, Label, SE->getStrTokenLoc(0)));
   } else if (!ExtnameUndeclaredIdentifiers.empty()) {
-    llvm::DenseMap<IdentifierInfo *, AsmLabelAttr *>::iterator I =
+    llvm::MapVector<IdentifierInfo *, AsmLabelAttr *>::iterator I =
         ExtnameUndeclaredIdentifiers.find(NewVD->getIdentifier());
     if (I != ExtnameUndeclaredIdentifiers.end()) {
       if (isDeclExternC(NewVD)) {
@@ -11499,8 +11477,8 @@ Sema::ActOnFunctionDeclarator(Scope *S, Declarator &D, DeclContext *DC,
     NewFD->addAttr(
         AsmLabelAttr::Create(Context, SE->getString(), SE->getStrTokenLoc(0)));
   } else if (!ExtnameUndeclaredIdentifiers.empty()) {
-    llvm::DenseMap<IdentifierInfo*,AsmLabelAttr*>::iterator I =
-      ExtnameUndeclaredIdentifiers.find(NewFD->getIdentifier());
+    llvm::MapVector<IdentifierInfo *, AsmLabelAttr *>::iterator I =
+        ExtnameUndeclaredIdentifiers.find(NewFD->getIdentifier());
     if (I != ExtnameUndeclaredIdentifiers.end()) {
       if (isDeclExternC(NewFD)) {
         NewFD->addAttr(I->second);
@@ -14945,6 +14923,7 @@ void Sema::AddInitializerToDecl(Decl *RealDecl, Expr *Init, bool DirectInit) {
   llvm::scope_exit ResetDeclForInitializer([this]() {
     if (!this->ExprEvalContexts.empty())
       this->ExprEvalContexts.back().DeclForInitializer = nullptr;
+    finalizeOutstandingTMOCandidates();
   });
 
   // If there is no declaration, there was an error parsing it.  Just ignore
@@ -16937,8 +16916,7 @@ Decl *Sema::ActOnParamDeclarator(Scope *S, Declarator &D,
     Diag(New->getLocation(), diag::err_block_on_nonlocal);
   }
 
-  if (getLangOpts().OpenCL)
-    deduceOpenCLAddressSpace(New);
+  New->deduceParmAddressSpace(Context);
 
   return New;
 }
@@ -17004,6 +16982,21 @@ ParmVarDecl *Sema::CheckParameter(DeclContext *DC, SourceLocation StartLoc,
                                   TypeSourceInfo *TSInfo, StorageClass SC) {
   // Perform Objective-C ARC adjustments.
   T = ObjC().AdjustParameterTypeForObjCAutoRefCount(T, NameLoc, TSInfo);
+
+  if (getLangOpts().OpenCL) {
+    assert(!isa<DecayedType>(T));
+    if (T->isArrayType() && !T.hasAddressSpace()) {
+      QualType ET = Context.getAsArrayType(T)->getElementType();
+      if (!ET.hasAddressSpace()) {
+        // Add the private address space to the contents of the pointer when a
+        // pointer parameter is declared as an array and not declared.
+        LangAS ImplAS = LangAS::opencl_private;
+        T = Context.getAddrSpaceQualType(T, ImplAS);
+        T = QualType(Context.getAsArrayType(T), 0);
+      }
+    }
+  }
+
   /*TO_UPSTREAM(BoundsSafety) ON*/
   QualType Adjusted = Context.getAdjustedParameterType(T);
 
@@ -17299,7 +17292,7 @@ Sema::CheckForFunctionRedefinition(FunctionDecl *FD,
   if (SkipBody && isRedefinitionAllowedFor(Definition, DefinitionVisible) &&
       (Definition->getFormalLinkage() == Linkage::Internal ||
        Definition->isInlined() || Definition->getDescribedFunctionTemplate() ||
-       Definition->getNumTemplateParameterLists())) {
+       !Definition->getTemplateParameterLists().empty())) {
     SkipBody->ShouldSkip = true;
     SkipBody->Previous = const_cast<FunctionDecl*>(Definition);
     if (!DefinitionVisible) {

@@ -4294,7 +4294,7 @@ static void RenderObjCOptions(const ToolChain &TC, const Driver &D,
     bool EnableConstantLiterals =
         Args.hasFlag(options::OPT_fobjc_constant_literals,
                      options::OPT_fno_objc_constant_literals,
-                     /*default=*/true) &&
+                     /*default=*/false) &&
         Runtime.hasConstantLiteralClasses();
     if (EnableConstantLiterals)
       CmdArgs.push_back("-fobjc-constant-literals");
@@ -5093,7 +5093,7 @@ void Clang::ConstructJob(Compilation &C, const JobAction &Job,
   }
 
   const llvm::Triple *AuxTriple =
-      (IsCuda || IsHIP) ? TC.getAuxTriple() : nullptr;
+      (IsCuda || IsHIP || IsSYCL) ? TC.getAuxTriple() : nullptr;
   bool IsWindowsMSVC = RawTriple.isWindowsMSVCEnvironment();
   bool IsUEFI = RawTriple.isUEFI();
   bool IsIAMCU = RawTriple.isOSIAMCU();
@@ -6093,6 +6093,28 @@ void Clang::ConstructJob(Compilation &C, const JobAction &Job,
   if (!Args.hasFlag(options::OPT_fstruct_path_tbaa,
                     options::OPT_fno_struct_path_tbaa, true))
     CmdArgs.push_back("-no-struct-path-tbaa");
+
+  if (Arg *A = Args.getLastArg(options::OPT_fstrict_bool,
+                               options::OPT_fno_strict_bool,
+                               options::OPT_fno_strict_bool_EQ)) {
+    StringRef BFM = "";
+    if (A->getOption().matches(options::OPT_fstrict_bool))
+      BFM = "strict";
+    else if (A->getOption().matches(options::OPT_fno_strict_bool))
+      BFM = "nonstrict";
+    else if (A->getValue() == StringRef("truncate"))
+      BFM = "truncate";
+    else if (A->getValue() == StringRef("nonzero"))
+      BFM = "nonzero";
+    else
+      D.Diag(diag::err_drv_invalid_value)
+          << A->getAsString(Args) << A->getValue();
+    CmdArgs.push_back(Args.MakeArgString("-load-bool-from-mem=" + BFM));
+  } else if (KernelOrKext) {
+    // If unspecified, assume -fno-strict-bool=truncate in the Darwin kernel.
+    CmdArgs.push_back("-load-bool-from-mem=truncate");
+  }
+
   Args.addOptInFlag(CmdArgs, options::OPT_fstrict_enums,
                     options::OPT_fno_strict_enums);
   Args.addOptOutFlag(CmdArgs, options::OPT_fstrict_return,
@@ -6453,7 +6475,8 @@ void Clang::ConstructJob(Compilation &C, const JobAction &Job,
 
   if (Arg *A = Args.getLastArg(options::OPT_fbasic_block_address_map,
                                options::OPT_fno_basic_block_address_map)) {
-    if ((Triple.isX86() || Triple.isAArch64()) && Triple.isOSBinFormatELF()) {
+    if (((Triple.isX86() || Triple.isAArch64()) && Triple.isOSBinFormatELF()) ||
+        (Triple.isX86() && Triple.isOSBinFormatCOFF())) {
       if (A->getOption().matches(options::OPT_fbasic_block_address_map))
         A->render(Args, CmdArgs);
     } else {
@@ -6699,8 +6722,22 @@ void Clang::ConstructJob(Compilation &C, const JobAction &Job,
         CmdArgs.push_back("-std=c++98");
       else
         CmdArgs.push_back("-std=c89");
-    else
+    else {
+      if (IsSYCL) {
+        const LangStandard *LangStd =
+            LangStandard::getLangStandardForName(Std->getValue());
+        if (LangStd) {
+          // Use of -std= with 'C' is not supported for SYCL.
+          if (LangStd->getLanguage() == Language::C)
+            D.Diag(diag::err_drv_argument_not_allowed_with)
+                << Std->getAsString(Args) << "-fsycl";
+          // SYCL requires C++17 or later.
+          else if (LangStd->isCPlusPlus() && !LangStd->isCPlusPlus17())
+            D.Diag(diag::err_drv_sycl_requires_cxx17) << Std->getAsString(Args);
+        }
+      }
       Std->render(Args, CmdArgs);
+    }
 
     // If -f(no-)trigraphs appears after the language standard flag, honor it.
     if (Arg *A = Args.getLastArg(options::OPT_std_EQ, options::OPT_ansi,
@@ -6724,6 +6761,13 @@ void Clang::ConstructJob(Compilation &C, const JobAction &Job,
     }
     else if (IsWindowsMSVC)
       ImplyVCPPCXXVer = true;
+
+    if (IsSYCL && types::isCXX(InputType) &&
+        !Args.hasArg(options::OPT__SLASH_std) && !IsWindowsMSVC)
+      // For SYCL, we default to -std=c++17 for all compilations. Use of -std
+      // on the command line will override. On Windows MSVC, this is handled
+      // by the ImplyVCPPCXXVer path below.
+      CmdArgs.push_back("-std=c++17");
 
     Args.AddLastArg(CmdArgs, options::OPT_ftrigraphs,
                     options::OPT_fno_trigraphs);
@@ -7701,13 +7745,30 @@ void Clang::ConstructJob(Compilation &C, const JobAction &Job,
                              .Case("c++23preview", "-std=c++23")
                              .Case("c++latest", "-std=c++26")
                              .Default("");
+      if (IsSYCL) {
+        const LangStandard *LangStd =
+            LangStandard::getLangStandardForName(StdArg->getValue());
+        if (LangStd) {
+          // Use of /std: with 'C' is not supported for SYCL.
+          if (LangStd->getLanguage() == Language::C)
+            D.Diag(diag::err_drv_argument_not_allowed_with)
+                << StdArg->getAsString(Args) << "-fsycl";
+          // SYCL requires C++17 or later.
+          else if (LangStd->isCPlusPlus() && !LangStd->isCPlusPlus17())
+            D.Diag(diag::err_drv_sycl_requires_cxx17)
+                << StdArg->getAsString(Args);
+        }
+      }
       if (LanguageStandard.empty())
         D.Diag(clang::diag::warn_drv_unused_argument)
             << StdArg->getAsString(Args);
     }
 
     if (LanguageStandard.empty()) {
-      if (IsMSVC2015Compatible)
+      if (IsSYCL)
+        // For SYCL, C++17 is the default.
+        LanguageStandard = "-std=c++17";
+      else if (IsMSVC2015Compatible)
         LanguageStandard = "-std=c++14";
       else
         LanguageStandard = "-std=c++11";
@@ -8389,7 +8450,8 @@ void Clang::ConstructJob(Compilation &C, const JobAction &Job,
     }
   }
 
-  if (Triple.isAMDGPU()) {
+  if (Triple.isAMDGPU() ||
+      (Triple.isSPIRV() && Triple.getVendor() == llvm::Triple::AMD)) {
     handleAMDGPUCodeObjectVersionOptions(D, Args, CmdArgs);
 
     Args.addOptInFlag(CmdArgs, options::OPT_munsafe_fp_atomics,

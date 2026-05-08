@@ -3547,9 +3547,9 @@ def err_ownership_type : Error<
 def err_ownership_takes_return_type : Error<
   "'ownership_returns' attribute only applies to functions that return a pointer">;
 def err_ownership_returns_index_mismatch : Error<
-  "'ownership_returns' attribute index does not match; here it is %0">;
+  "'ownership_returns' attribute index does not match; here it is %select{%0|omitted}1">;
 def note_ownership_returns_index_mismatch : Note<
-  "declared with index %0 here">;
+  "declared %select{with index %0|without an index}1 here">;
 def err_ownership_takes_class_mismatch : Error<
   "'ownership_takes' attribute class does not match; here it is '%0'">;
 def note_ownership_takes_class_mismatch : Note<
@@ -3932,8 +3932,8 @@ def warn_cmse_nonsecure_union : Warning<
   InGroup<DiagGroup<"cmse-union-leak">>;
 def err_attribute_weak_static : Error<
   "weak declaration cannot have internal linkage">;
-def err_attribute_selectany_non_extern_data : Error<
-  "'selectany' can only be applied to data items with external linkage">;
+def err_attribute_selectany_non_extern_var : Error<
+  "'selectany' can only be applied to variables with external linkage">;
 def warn_attribute_hybrid_patchable_non_extern : Warning<
   "'hybrid_patchable' is ignored on functions without external linkage">,
   InGroup<IgnoredAttributes>;
@@ -4368,6 +4368,9 @@ def warn_thread_attribute_not_on_scoped_lockable_param : Warning<
   InGroup<ThreadSafetyAttributes>, DefaultIgnore;
 def warn_thread_attribute_requires_preceded : Warning<
   "%0 attribute on %1 must be preceded by %2 attribute">,
+  InGroup<ThreadSafetyAttributes>, DefaultIgnore;
+def warn_thread_attribute_not_on_fun_ptr : Warning<
+  "%0 attribute on a %select{variable|field}1 requires the %select{variable|field}1 to be of function pointer type">,
   InGroup<ThreadSafetyAttributes>, DefaultIgnore;
 def err_attribute_argument_out_of_bounds_extra_info : Error<
   "%0 attribute parameter %1 is out of bounds: "
@@ -6615,9 +6618,6 @@ def err_inline_declaration_block_scope : Error<
   "inline declaration of %0 not allowed in block scope">;
 def err_static_non_static : Error<
   "static declaration of %0 follows non-static declaration">;
-def err_internal_extern_mismatch : Error<
-  "variable %0 declared with both internal and external linkage "
-  "in the same translation unit%select{; behavior is undefined|}1">;
 def err_different_language_linkage : Error<
   "declaration of %0 has a different language linkage">;
 def ext_retained_language_linkage : Extension<
@@ -6775,7 +6775,7 @@ def err_typecheck_invalid_restrict_invalid_pointee : Error<
 def ext_typecheck_zero_array_size : Extension<
   "zero size arrays are an extension">, InGroup<ZeroLengthArray>;
 def err_typecheck_zero_array_size : Error<
-  "zero-length arrays are not permitted in %select{C++|SYCL device code|HIP device code}0">;
+  "zero-length arrays are not permitted in %select{C++|SYCL device code|HIP device code|OpenCL}0">;
 def err_array_size_non_int : Error<"size of array has non-integer type %0">;
 def err_init_element_not_constant : Error<
   "initializer element is not a compile-time constant">;
@@ -9836,7 +9836,8 @@ def warn_kern_is_inline : Warning<
   "ignored 'inline' attribute on kernel function %0">,
   InGroup<CudaCompat>;
 def err_variadic_device_fn : Error<
-  "CUDA device code does not support variadic functions">;
+  "%enum_select<OffloadLang>{%CUDA{CUDA}|%SYCL{SYCL}}0 device code does not "
+  "support variadic functions">;
 def err_va_arg_in_device : Error<
 "CUDA device code does not support va_arg">;
 def err_alias_not_supported_on_nvptx : Error<"CUDA older than 10.0 does not support .alias">;
@@ -11640,6 +11641,8 @@ def err_duplicate_attribute
     : Error<"attribute %0 is already applied with different arguments">;
 def err_disallowed_duplicate_attribute : Error<
   "attribute %0 cannot appear more than once on a declaration">;
+def err_incompatible_duplicate_attribute : Error<
+  "attribute %0 is already applied with different arguments">;
 
 def warn_sync_fetch_and_nand_semantics_change : Warning<
   "the semantics of this intrinsic changed with GCC "
@@ -11913,6 +11916,9 @@ def err_opencl_requires_extension : Error<
 def ext_opencl_double_without_pragma : Extension<
   "Clang permits use of type 'double' regardless pragma if 'cl_khr_fp64' is"
   " supported">;
+def warn_opencl_longlong : Warning<
+  "'long long' is a reserved data type in OpenCL C">,
+  InGroup<ReservedIdentifier>;
 def warn_opencl_generic_address_space_arg : Warning<
   "passing non-generic address space pointer to %0"
   " may cause dynamic conversion affecting performance">,
@@ -12201,6 +12207,9 @@ def note_omp_collapse_ordered_expr : Note<
   "as specified in %select{'collapse'|'ordered'|'collapse' and 'ordered'}0 clause%select{||s}0">;
 def err_omp_negative_expression_in_clause : Error<
   "argument to '%0' clause must be a %select{non-negative|strictly positive}1 integer value">;
+def err_omp_device_expression_invalid : Error<
+  "argument to 'device' clause must be a non-negative integer value, "
+  "'omp_initial_device' (-1), or 'omp_invalid_device' (-2)">;
 def err_omp_large_expression_in_clause : Error<
   "argument to '%0' clause requires a value that can be represented by a 64-bit">;
 def err_omp_not_integral : Error<
@@ -12963,6 +12972,9 @@ def note_redefinition_include_same_file : Note<
 }
 
 let CategoryName = "Coroutines Issue" in {
+def warn_coroutines_x86_windows : Warning<
+  "coroutines are not currently supported on the 32-bit x86 Microsoft ABI">,
+  InGroup<DiagGroup<"coroutines-unsupported-target">>;
 def err_return_in_coroutine : Error<
   "return statement not allowed in coroutine; did you mean 'co_return'?">;
 def note_declared_coroutine_here : Note<
@@ -14520,6 +14532,7 @@ def err_hlsl_builtin_resource_coordinate_dimension_mismatch : Error<
   "builtin %0 resource coordinate dimension mismatch: expected %1, found %2">;
 
 // HLSL Diagnostics
+def err_hlsl_cstor_dstor : Error<"HLSL does not support constructors or destructors">;
 def err_hlsl_langstd_unimplemented : Error<"support for HLSL language version %0 is incomplete">;
 def err_hlsl_attr_unsupported_in_stage : Error<"attribute %0 is unsupported in '%1' shaders, requires %select{|one of the following: }2%3">;
 def err_hlsl_attr_invalid_type : Error<
@@ -14528,6 +14541,10 @@ def err_hlsl_attr_invalid_ast_node : Error<
    "attribute %0 only applies to %1">;
 def err_hlsl_attr_incompatible
     : Error<"%0 attribute is not compatible with %1 attribute">;
+def err_hlsl_matrix_layout_non_matrix
+    : Error<"%0 attribute can only be applied to a matrix type">;
+def err_hlsl_matrix_layout_conflict
+    : Error<"%0 and %1 attributes are not compatible">;
 
 def err_hlsl_entry_shader_attr_mismatch : Error<
    "%0 attribute on entry function does not match the target profile">;
@@ -15219,4 +15236,42 @@ def err_cuda_device_kernel_launch_not_supported
 def err_cuda_device_kernel_launch_require_rdc
     : Error<"kernel launch from __device__ or __global__ function requires "
             "relocatable device code (i.e. requires -fgpu-rdc)">;
+
+// TMO warnings and notes
+def err_tmo_non_function : Error<
+  "the typed_memory_operations attribute can only be applied to functions">;
+
+def err_tmo_invalid_inferred_parameter_type : Error<
+  "invalid parameter type for inference at index %0. %1 is not an integer type">;
+
+def err_tmo_function_kind_error : Error<
+  "%select{untyped|typed}0 memory operation %1 %select{cannot be a variadic function|cannot be an instance method|must have a prototype|must be a function}2">;
+
+def err_tmo_rewrite_target_is_overloaded : Error<
+  "typed memory operation %0 has multiple overloads">;
+
+def err_tmo_rewrite_target_type_mismatch : Error<
+  "typed memory operation %0 has incompatible type (%diff{$ vs $|}1,2)">;
+
+def note_tmo_rewrite_target_type_mismatch : Note<
+  "rewrite target here">;
+
+def warn_tmo_inference_failed
+    : Warning<"could not infer allocation type in call to %0">,
+      InGroup<DiagGroup<"typed-memory-inference-failure">>,
+      DefaultIgnore;
+def remark_tmo_passed_type : Remark<
+  "passing TMO information for %0%1 to %2%select{ (retargeted from %4)|}3">,
+  InGroup<TMODiagnosticRemarks>;
+
+def note_tmo_failed_inference_source
+    : Note<"unable to infer allocation type from expression %0">;
+def note_tmo_inference_result : Note<"inferred %0 from %select{expression|cast "
+                                     "of result from call to}1 %2">;
+def note_tmo_type_encoding : Note<"encoding %0%1 as %2. %3">;
+def remark_tmo_get_descriptor_info
+    : Remark<"__builtin_tmo_get_type_descriptor reported %0 as %1. Type "
+             "semantics: %2">,
+      InGroup<TMODiagnosticRemarks>;
+
 } // end of sema component.

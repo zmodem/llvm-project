@@ -441,10 +441,30 @@ static void checkAttrArgsAreCapabilityObjs(Sema &S, Decl *D,
   }
 }
 
+/// True if T (or its pointee, after stripping a top-level reference) is a
+/// function pointer or dependent.
+static bool isFunctionPointerOrDependent(QualType T) {
+  T = T.getNonReferenceType();
+  return T->isDependentType() || T->isFunctionPointerType();
+}
+
+/// Checks that thread-safety attributes on variables or fields apply only to
+/// function pointer types.
+static bool checkThreadSafetyValueDeclIsFunPtr(Sema &S, const ValueDecl *VD,
+                                               const AttributeCommonInfo &A) {
+  if (isFunctionPointerOrDependent(VD->getType()))
+    return true;
+  S.Diag(A.getLoc(), diag::warn_thread_attribute_not_on_fun_ptr)
+      << A << (isa<FieldDecl>(VD) ? 1 : 0);
+  return false;
+}
+
 static bool checkFunParamsAreScopedLockable(Sema &S,
                                             const ParmVarDecl *ParamDecl,
-                                            const ParsedAttr &AL) {
+                                            const AttributeCommonInfo &AL) {
   QualType ParamType = ParamDecl->getType();
+  if (ParamType->isDependentType())
+    return true;
   if (const auto *RefType = ParamType->getAs<ReferenceType>();
       RefType &&
       checkRecordTypeForScopedCapability(S, RefType->getPointeeType()))
@@ -452,6 +472,48 @@ static bool checkFunParamsAreScopedLockable(Sema &S,
   S.Diag(AL.getLoc(), diag::warn_thread_attribute_not_on_scoped_lockable_param)
       << AL;
   return false;
+}
+
+static bool checkThreadSafetyAttrSubject(Sema &S, Decl *D, const ParsedAttr &AL,
+                                         bool CheckParmVar = false) {
+  const auto *VD = dyn_cast<ValueDecl>(D);
+  if (!VD || isa<FunctionDecl>(VD))
+    return true;
+
+  if (CheckParmVar) {
+    if (const auto *PVD = dyn_cast<ParmVarDecl>(VD)) {
+      // A function-pointer parameter is also valid here.
+      if (isFunctionPointerOrDependent(PVD->getType()))
+        return true;
+      return checkFunParamsAreScopedLockable(S, PVD, AL);
+    }
+  }
+
+  return checkThreadSafetyValueDeclIsFunPtr(S, VD, AL);
+}
+
+bool Sema::checkInstantiatedThreadSafetyAttrs(const Decl *D, const Attr *A) {
+  if (!isa<AssertCapabilityAttr, AcquireCapabilityAttr,
+           TryAcquireCapabilityAttr, ReleaseCapabilityAttr,
+           RequiresCapabilityAttr, LocksExcludedAttr>(A))
+    return true;
+
+  const auto *VD = dyn_cast<ValueDecl>(D);
+  if (!VD)
+    return true;
+
+  // Parameters of template functions need to be re-checked during
+  // instantiation because their types might have been dependent.
+  if (const auto *PVD = dyn_cast<ParmVarDecl>(VD)) {
+    if (isFunctionPointerOrDependent(PVD->getType()))
+      return true;
+    return checkFunParamsAreScopedLockable(*this, PVD, *A);
+  }
+
+  if (isa<FunctionDecl>(VD))
+    return true;
+
+  return checkThreadSafetyValueDeclIsFunPtr(*this, VD, *A);
 }
 
 //===----------------------------------------------------------------------===//
@@ -635,8 +697,7 @@ static void handleLockReturnedAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
 }
 
 static void handleLocksExcludedAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
-  if (const auto *ParmDecl = dyn_cast<ParmVarDecl>(D);
-      ParmDecl && !checkFunParamsAreScopedLockable(S, ParmDecl, AL))
+  if (!checkThreadSafetyAttrSubject(S, D, AL, /*CheckParmVar=*/true))
     return;
 
   if (!AL.checkAtLeastNumArgs(S, 1))
@@ -1524,6 +1585,20 @@ static void handleOwnershipAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
     Module = &S.PP.getIdentifierTable().get(ModuleName);
   }
 
+  // Check if the new ownership_returns attribute does not contain
+  // an index, but previous attributes do.
+  if (K == OwnershipAttr::Returns && AL.getNumArgs() == 1) {
+    for (const auto *I : D->specific_attrs<OwnershipAttr>()) {
+      if (I->getOwnKind() == OwnershipAttr::Returns && I->args_size() > 0) {
+        S.Diag(I->getLocation(), diag::err_ownership_returns_index_mismatch)
+            << I->args_begin()->getSourceIndex() << 0;
+        S.Diag(AL.getLoc(), diag::note_ownership_returns_index_mismatch)
+            << 0 << 1;
+        return;
+      }
+    }
+  }
+
   SmallVector<ParamIdx, 8> OwnershipArgs;
   for (unsigned i = 1; i < AL.getNumArgs(); ++i) {
     Expr *Ex = AL.getArgAsExpr(i);
@@ -1556,21 +1631,25 @@ static void handleOwnershipAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
       // Cannot have two ownership attributes of different kinds for the same
       // index.
       if (I->getOwnKind() != K && llvm::is_contained(I->args(), Idx)) {
-          S.Diag(AL.getLoc(), diag::err_attributes_are_not_compatible)
-              << AL << I
-              << (AL.isRegularKeywordAttribute() ||
-                  I->isRegularKeywordAttribute());
-          return;
-      } else if (K == OwnershipAttr::Returns &&
-                 I->getOwnKind() == OwnershipAttr::Returns) {
-        // A returns attribute conflicts with any other returns attribute using
-        // a different index.
-        if (!llvm::is_contained(I->args(), Idx)) {
+        S.Diag(AL.getLoc(), diag::err_attributes_are_not_compatible)
+            << AL << I
+            << (AL.isRegularKeywordAttribute() ||
+                I->isRegularKeywordAttribute());
+        return;
+      }
+
+      if (K == OwnershipAttr::Returns &&
+          I->getOwnKind() == OwnershipAttr::Returns) {
+        bool IHasArgs = I->args_size() > 0;
+
+        if (!IHasArgs || !llvm::is_contained(I->args(), Idx)) {
+          unsigned IIdx = IHasArgs ? I->args_begin()->getSourceIndex() : 0;
+
           S.Diag(I->getLocation(), diag::err_ownership_returns_index_mismatch)
-              << I->args_begin()->getSourceIndex();
-          if (I->args_size())
-            S.Diag(AL.getLoc(), diag::note_ownership_returns_index_mismatch)
-                << Idx.getSourceIndex() << Ex->getSourceRange();
+              << IIdx << (IHasArgs ? 0 : 1);
+
+          S.Diag(AL.getLoc(), diag::note_ownership_returns_index_mismatch)
+              << Idx.getSourceIndex() << 0 << Ex->getSourceRange();
           return;
         }
       } else if (K == OwnershipAttr::Takes &&
@@ -5951,14 +6030,12 @@ bool Sema::CheckCallingConvAttr(const ParsedAttr &Attrs, CallingConv &CC,
       A = HostTI->checkCallingConvention(CC);
     if (A == TargetInfo::CCCR_OK && CheckDevice && DeviceTI)
       A = DeviceTI->checkCallingConvention(CC);
-  } else if (LangOpts.SYCLIsDevice && TI.getTriple().isAMDGPU() &&
-             CC == CC_X86VectorCall) {
-    // Assuming SYCL Device AMDGPU CC_X86VectorCall functions are always to be
-    // emitted on the host. The MSVC STL has CC-based specializations so we
-    // cannot change the CC to be the default as that will cause a clash with
-    // another specialization.
-    A = TI.checkCallingConvention(CC);
-    if (Aux && A != TargetInfo::CCCR_OK)
+  } else if (LangOpts.SYCLIsDevice) {
+    // In SYCL we may meet unsupported calling conventions in host code,
+    // especially inside of included headers. Now we don't know if they will be
+    // emitted, so we just defer any diagnostics. Check for the host triple if
+    // we have one, since everything is still emitted for the host.
+    if (Aux)
       A = Aux->checkCallingConvention(CC);
   } else {
     A = TI.checkCallingConvention(CC);
@@ -8219,6 +8296,9 @@ static void handleReentrantCapabilityAttr(Sema &S, Decl *D,
 }
 
 static void handleAssertCapabilityAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
+  if (!checkThreadSafetyAttrSubject(S, D, AL))
+    return;
+
   SmallVector<Expr*, 1> Args;
   if (!checkLockFunAttrCommon(S, D, AL, Args))
     return;
@@ -8229,8 +8309,7 @@ static void handleAssertCapabilityAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
 
 static void handleAcquireCapabilityAttr(Sema &S, Decl *D,
                                         const ParsedAttr &AL) {
-  if (const auto *ParmDecl = dyn_cast<ParmVarDecl>(D);
-      ParmDecl && !checkFunParamsAreScopedLockable(S, ParmDecl, AL))
+  if (!checkThreadSafetyAttrSubject(S, D, AL, /*CheckParmVar=*/true))
     return;
 
   SmallVector<Expr*, 1> Args;
@@ -8243,6 +8322,9 @@ static void handleAcquireCapabilityAttr(Sema &S, Decl *D,
 
 static void handleTryAcquireCapabilityAttr(Sema &S, Decl *D,
                                            const ParsedAttr &AL) {
+  if (!checkThreadSafetyAttrSubject(S, D, AL))
+    return;
+
   SmallVector<Expr*, 2> Args;
   if (!checkTryLockFunAttrCommon(S, D, AL, Args))
     return;
@@ -8253,9 +8335,9 @@ static void handleTryAcquireCapabilityAttr(Sema &S, Decl *D,
 
 static void handleReleaseCapabilityAttr(Sema &S, Decl *D,
                                         const ParsedAttr &AL) {
-  if (const auto *ParmDecl = dyn_cast<ParmVarDecl>(D);
-      ParmDecl && !checkFunParamsAreScopedLockable(S, ParmDecl, AL))
+  if (!checkThreadSafetyAttrSubject(S, D, AL, /*CheckParmVar=*/true))
     return;
+
   // Check that all arguments are lockable objects.
   SmallVector<Expr *, 1> Args;
   checkAttrArgsAreCapabilityObjs(S, D, AL, Args, 0, true);
@@ -8266,8 +8348,7 @@ static void handleReleaseCapabilityAttr(Sema &S, Decl *D,
 
 static void handleRequiresCapabilityAttr(Sema &S, Decl *D,
                                          const ParsedAttr &AL) {
-  if (const auto *ParmDecl = dyn_cast<ParmVarDecl>(D);
-      ParmDecl && !checkFunParamsAreScopedLockable(S, ParmDecl, AL))
+  if (!checkThreadSafetyAttrSubject(S, D, AL, /*CheckParmVar=*/true))
     return;
 
   if (!AL.checkAtLeastNumArgs(S, 1))
@@ -8428,8 +8509,6 @@ static void handleNoPFPAttrField(Sema &S, Decl *D, const ParsedAttr &AL) {
 
 // TO_UPSTREAM(BoundsSafety) Rename to indicate not just fields and counted_by.
 static void handleCountedByAttrField(Sema &S, Decl *D, const ParsedAttr &AL) {
-  auto *FD = dyn_cast<FieldDecl>(D);
-
   /* TO_UPSTREAM(BoundsSafety) ON */
   if (!S.getLangOpts().BoundsSafetyAttributes && !isa<FieldDecl>(D)) {
     // In upstream 'counted_by' is subjected to FieldDecl only, whereas internally,
@@ -8501,6 +8580,7 @@ static void handleCountedByAttrField(Sema &S, Decl *D, const ParsedAttr &AL) {
     llvm_unreachable("unexpected counted_by family attribute");
   }
 
+  FieldDecl *FD = cast<FieldDecl>(D);
   if (S.CheckCountedByAttrOnField(FD, CountExpr, CountInBytes, OrNull))
     return;
 
@@ -8687,6 +8767,180 @@ static void handleEnforceTCBAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
   }
 
   D->addAttr(AttrTy::Create(S.Context, Argument, AL));
+}
+
+static bool typedMemoryTypesAreEquivalentOrDependent(const ASTContext &Context,
+                                                     QualType SourceType,
+                                                     QualType DestinationType) {
+  SourceType = Context.getCanonicalType(SourceType).getUnqualifiedType();
+  DestinationType =
+      Context.getCanonicalType(DestinationType).getUnqualifiedType();
+  if (SourceType->isDependentType() || DestinationType->isDependentType())
+    return true;
+  return SourceType == DestinationType;
+}
+
+static void handleTypedMemory(Sema &S, Decl *D, const ParsedAttr &AL) {
+  if (!S.getLangOpts().TypedMemoryOperations)
+    return;
+
+  FunctionDecl *SourceDecl = D->getAsFunction();
+  if (isFunctionOrMethodVariadic(D) || isInstanceMethod(D)) {
+    S.Diag(SourceDecl->getBeginLoc(), diag::err_tmo_function_kind_error)
+        << 0 << SourceDecl << (isFunctionOrMethodVariadic(D) ? 0 : 1);
+    AL.setInvalid();
+    return;
+  }
+
+  auto Loc = AL.getLoc();
+  if (!SourceDecl) {
+    auto *ND = cast<NamedDecl>(D);
+    S.Diag(Loc, diag::err_tmo_function_kind_error) << 0 << ND << 3;
+    AL.setInvalid();
+    return;
+  }
+  if (AL.getNumArgs() < 2) {
+    S.Diag(Loc, diag::err_attribute_too_few_arguments) << AL;
+    AL.setInvalid();
+    return;
+  }
+  if (AL.getNumArgs() > 3) {
+    S.Diag(Loc, diag::err_attribute_too_many_arguments) << AL;
+    AL.setInvalid();
+    return;
+  }
+  Expr *TargetExpr = AL.getArgAsExpr(0);
+  FunctionDecl *TargetDecl = nullptr;
+  DeclarationNameInfo TargetName;
+  if (auto *DRE = dyn_cast<DeclRefExpr>(TargetExpr)) {
+    TargetDecl = dyn_cast<FunctionDecl>(DRE->getDecl());
+    TargetName = DRE->getNameInfo();
+    if (!TargetDecl) {
+      S.Diag(Loc, diag::err_tmo_function_kind_error)
+          << DRE->getSourceRange() << 1 << DRE->getNameInfo().getName() << 3;
+      AL.setInvalid();
+      return;
+    }
+  } else if (auto *ULE = dyn_cast<UnresolvedLookupExpr>(TargetExpr)) {
+    TargetDecl = S.ResolveSingleFunctionTemplateSpecialization(ULE, true);
+    TargetName = ULE->getNameInfo();
+    if (!TargetDecl) {
+      S.Diag(Loc, diag::err_tmo_rewrite_target_is_overloaded)
+          << TargetName.getName();
+      if (ULE->getType() == S.Context.OverloadTy)
+        S.NoteAllOverloadCandidates(ULE);
+      AL.setInvalid();
+      return;
+    }
+  } else {
+    S.Diag(Loc, diag::err_tmo_function_kind_error)
+        << TargetExpr->getSourceRange() << 1 << TargetExpr << 3;
+    AL.setInvalid();
+    return;
+  }
+
+  TargetDecl = TargetDecl->getCanonicalDecl();
+  ParamIdx InferredParameterIdx;
+  if (!S.checkFunctionOrMethodParameterIndex(D, AL, 1, AL.getArgAsExpr(1),
+                                             InferredParameterIdx))
+    return;
+
+  auto *InferredParam =
+      SourceDecl->getParamDecl(InferredParameterIdx.getASTIndex());
+  auto SizeType = InferredParam->getType();
+  auto isIntegerOrDependentNonArrayType = [](QualType QT) -> bool {
+    auto *T = QT->getUnqualifiedDesugaredType();
+    if (T->isIntegerType())
+      return true;
+    if (T->isDependentSizedArrayType())
+      return false;
+    return T->isDependentType();
+  };
+  if (!isIntegerOrDependentNonArrayType(SizeType)) {
+    S.Diag(Loc, diag::err_tmo_invalid_inferred_parameter_type)
+        << InferredParameterIdx.getSourceIndex() << SizeType
+        << InferredParam->getLocation();
+    AL.setInvalid();
+    return;
+  }
+
+  if (!hasFunctionProto(TargetDecl) || isFunctionOrMethodVariadic(TargetDecl) ||
+      isInstanceMethod(TargetDecl)) {
+    unsigned MessageSelector = !hasFunctionProto(TargetDecl)            ? 2u
+                               : isFunctionOrMethodVariadic(TargetDecl) ? 1u
+                                                                        : 0u;
+    S.Diag(Loc, diag::err_tmo_function_kind_error)
+        << 1 << TargetDecl << MessageSelector;
+    AL.setInvalid();
+    return;
+  }
+
+  auto reportTargetTypeMismatchError = [&]() {
+    std::vector<QualType> ExpectedArguments;
+    for (size_t I = 0; I < InferredParameterIdx.getSourceIndex(); I++)
+      ExpectedArguments.push_back(SourceDecl->getParamDecl(I)->getType());
+    ExpectedArguments.push_back(S.Context.getIntTypeForBitwidth(64, false));
+    for (size_t I = InferredParameterIdx.getSourceIndex();
+         I < SourceDecl->getNumParams(); I++)
+      ExpectedArguments.push_back(SourceDecl->getParamDecl(I)->getType());
+    FunctionProtoType::ExtProtoInfo EPI = {};
+    auto ExpectedType = S.Context.getFunctionType(SourceDecl->getReturnType(),
+                                                  ExpectedArguments, EPI);
+    S.Diag(Loc, diag::err_tmo_rewrite_target_type_mismatch)
+        << TargetDecl->getNameInfo().getName() << ExpectedType
+        << TargetDecl->getType();
+    S.Diag(TargetDecl->getLocation(),
+           diag::note_tmo_rewrite_target_type_mismatch);
+    AL.setInvalid();
+  };
+
+  if (!typedMemoryTypesAreEquivalentOrDependent(S.Context,
+                                                TargetDecl->getReturnType(),
+                                                SourceDecl->getReturnType())) {
+    reportTargetTypeMismatchError();
+    return;
+  }
+
+  if (getFunctionOrMethodNumParams(TargetDecl) !=
+      getFunctionOrMethodNumParams(SourceDecl) + 1) {
+    reportTargetTypeMismatchError();
+    return;
+  }
+
+  auto *TargetTypeDescriptorParam = getFunctionOrMethodParam(
+      TargetDecl, InferredParameterIdx.getASTIndex() + 1);
+  auto TargetTypeDescriptorType = TargetTypeDescriptorParam->getType();
+  if (!TargetTypeDescriptorType->isDependentType()) {
+    if (!TargetTypeDescriptorType->isIntegerType() ||
+        S.Context.getTypeSize(TargetTypeDescriptorType) != 64) {
+      reportTargetTypeMismatchError();
+      return;
+    }
+  }
+
+  size_t SourceParameterIdx = 0;
+  size_t TargetParameterIdx = 0;
+  for (; SourceParameterIdx < getFunctionOrMethodNumParams(SourceDecl);
+       SourceParameterIdx++, TargetParameterIdx++) {
+    auto *SourceParamDecl =
+        getFunctionOrMethodParam(SourceDecl, SourceParameterIdx);
+    auto *TargetParamDecl =
+        getFunctionOrMethodParam(TargetDecl, TargetParameterIdx);
+    if (!typedMemoryTypesAreEquivalentOrDependent(S.Context,
+                                                  SourceParamDecl->getType(),
+                                                  TargetParamDecl->getType())) {
+      reportTargetTypeMismatchError();
+      return;
+    }
+    if (SourceParameterIdx == InferredParameterIdx.getASTIndex())
+      TargetParameterIdx++;
+  }
+  if (AL.isInvalid())
+    return;
+
+  auto *TMA = ::new (S.Context)
+      TypedMemoryAttr(S.Context, AL, TargetDecl, InferredParameterIdx);
+  D->addAttr(TMA);
 }
 
 template <typename AttrTy, typename ConflictingAttrTy>
@@ -9697,6 +9951,9 @@ ProcessDeclAttribute(Sema &S, Scope *scope, Decl *D, const ParsedAttr &AL,
   case ParsedAttr::AT_HLSLParamModifier:
     S.HLSL().handleParamModifierAttr(D, AL);
     break;
+  case ParsedAttr::AT_HLSLMatrixLayout:
+    S.HLSL().handleMatrixLayoutAttr(D, AL);
+    break;
   case ParsedAttr::AT_HLSLUnparsedSemantic:
     S.HLSL().handleSemanticAttr(D, AL);
     break;
@@ -9893,6 +10150,10 @@ ProcessDeclAttribute(Sema &S, Scope *scope, Decl *D, const ParsedAttr &AL,
 
   case ParsedAttr::AT_EnforceTCBLeaf:
     handleEnforceTCBAttr<EnforceTCBLeafAttr, EnforceTCBAttr>(S, D, AL);
+    break;
+
+  case ParsedAttr::AT_TypedMemory:
+    handleTypedMemory(S, D, AL);
     break;
 
   case ParsedAttr::AT_BuiltinAlias:

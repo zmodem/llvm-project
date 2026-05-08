@@ -1,4 +1,5 @@
 set(LLVM_LINK_COMPONENTS
+  ABI
   AggressiveInstCombine
   Analysis
   BitReader
@@ -96,6 +97,7 @@ add_clang_library(clangCodeGen
   CGRecordLayoutBuilder.cpp
   CGStmt.cpp
   CGStmtOpenMP.cpp
+  CGTypedMemory.cpp
   CGVTT.cpp
   CGVTables.cpp
   CodeGenABITypes.cpp

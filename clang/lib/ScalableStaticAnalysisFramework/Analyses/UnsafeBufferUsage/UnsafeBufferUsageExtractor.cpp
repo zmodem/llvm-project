@@ -13,8 +13,6 @@
 #include "clang/Analysis/Analyses/UnsafeBufferUsage.h"
 #include "clang/ScalableStaticAnalysisFramework/Analyses/EntityPointerLevel/EntityPointerLevel.h"
 #include "clang/ScalableStaticAnalysisFramework/Analyses/UnsafeBufferUsage/UnsafeBufferUsage.h"
-#include "clang/ScalableStaticAnalysisFramework/Core/ASTEntityMapping.h"
-#include "clang/ScalableStaticAnalysisFramework/Core/Model/EntityName.h"
 #include "clang/ScalableStaticAnalysisFramework/Core/TUSummary/ExtractorRegistry.h"
 #include "clang/ScalableStaticAnalysisFramework/Core/TUSummary/TUSummaryBuilder.h"
 #include "clang/ScalableStaticAnalysisFramework/Core/TUSummary/TUSummaryExtractor.h"
@@ -25,27 +23,6 @@
 using namespace clang;
 using namespace ssaf;
 
-namespace {
-std::set<const Expr *>
-findUnsafePointersInContributor(const DynTypedNode &Node) {
-  const Decl *D = Node.get<Decl>();
-
-  if (!D)
-    return {};
-  if (isa<FunctionDecl, VarDecl>(D))
-    return findUnsafePointers(D);
-  if (auto *RD = dyn_cast<RecordDecl>(D)) {
-    std::set<const Expr *> Result;
-
-    for (const FieldDecl *FD : RD->fields()) {
-      Result.merge(findUnsafePointers(FD));
-    }
-    return Result;
-  }
-  return {};
-}
-} // namespace
-
 namespace clang::ssaf {
 class UnsafeBufferUsageTUSummaryExtractor : public TUSummaryExtractor {
 public:
@@ -54,7 +31,6 @@ public:
 
   Expected<std::unique_ptr<UnsafeBufferUsageEntitySummary>>
   extractEntitySummary(const NamedDecl *Contributor, ASTContext &Ctx);
-
   void HandleTranslationUnit(ASTContext &Ctx) override;
 };
 } // namespace clang::ssaf
@@ -64,9 +40,8 @@ clang::ssaf::UnsafeBufferUsageTUSummaryExtractor::extractEntitySummary(
     const NamedDecl *Contributor, ASTContext &Ctx) {
   std::set<const Expr *> UnsafePointers;
 
-  auto MatchAction = [&UnsafePointers](const DynTypedNode &Node) {
-    auto Result = findUnsafePointersInContributor(Node);
-    UnsafePointers.insert(Result.begin(), Result.end());
+  auto MatchAction = [&UnsafePointers, &Ctx](const DynTypedNode &Node) {
+    matchUnsafePointers(Node, Ctx, UnsafePointers);
   };
   findMatchesIn(Contributor, MatchAction);
 
@@ -74,9 +49,7 @@ clang::ssaf::UnsafeBufferUsageTUSummaryExtractor::extractEntitySummary(
 
   for (const Expr *Ptr : UnsafePointers) {
     Expected<EntityPointerLevelSet> Translation =
-        translateEntityPointerLevel(Ptr, Ctx, [this](const EntityName &EN) {
-          return SummaryBuilder.addEntity(EN);
-        });
+        translateEntityPointerLevel(Ptr, Ctx, *this);
 
     if (Translation) {
       // Filter out those temporary invalid EntityPointerLevels associated
@@ -109,14 +82,13 @@ void clang::ssaf::UnsafeBufferUsageTUSummaryExtractor::HandleTranslationUnit(
     if ((*EntitySummary)->empty())
       continue;
 
-    auto ContributorName = getEntityName(CD);
+    auto ContributorId = addEntity(CD);
 
-    if (!ContributorName)
+    if (!ContributorId)
       llvm::reportFatalInternalError(makeEntityNameErr(Ctx, CD));
 
     [[maybe_unused]] auto [Ignored, InsertionSucceeded] =
-        SummaryBuilder.addSummary(SummaryBuilder.addEntity(*ContributorName),
-                                  std::move(*EntitySummary));
+        SummaryBuilder.addSummary(*ContributorId, std::move(*EntitySummary));
 
     assert(InsertionSucceeded && "duplicated contributor extraction");
   }
@@ -126,6 +98,6 @@ void clang::ssaf::UnsafeBufferUsageTUSummaryExtractor::HandleTranslationUnit(
 volatile int UnsafeBufferUsageTUSummaryExtractorAnchorSource = 0;
 
 static clang::ssaf::TUSummaryExtractorRegistry::Add<
-    ssaf::UnsafeBufferUsageTUSummaryExtractor>
+    UnsafeBufferUsageTUSummaryExtractor>
     RegisterExtractor(UnsafeBufferUsageEntitySummary::Name,
-                      "The TUSummaryExtractor for unsafe buffer pointers");
+                      "Extract unsafe buffer pointers");
